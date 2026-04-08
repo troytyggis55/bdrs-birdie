@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc:*)",
+      "WebFetch(domain:rsewiki.electro.dtu.dk)"
+    ]
+  }
+}
