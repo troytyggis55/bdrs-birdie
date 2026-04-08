@@ -79,16 +79,19 @@ def find_debug_image(frame_idx):
 def draw_map(ax, detections, title="Ball positions"):
     """
     Draw a top-down 2D coordinate map on ax.
-      Horizontal axis: y_r (robot left = positive, right = negative)
-      Vertical axis:   x_r (forward distance from robot)
+      Horizontal axis: -y_r  (left of robot = left on screen)
+      Vertical axis:    x_r  (forward distance from robot, up on screen)
       Robot at (0, 0), facing up.
+
+    y_r convention: positive = robot's left (camera +X → robot -Y), so we
+    negate it when plotting so that left-of-robot appears on the left side.
     """
     ax.set_xlim(*MAP_X_RANGE)
     ax.set_ylim(*MAP_Y_RANGE)
-    ax.set_xlabel("y_r  [m]  ← left · right →")
+    ax.set_xlabel("← left  [m]  right →")
     ax.set_ylabel("x_r  [m]  (forward)")
     ax.set_title(title)
-    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_aspect('equal', adjustable='box')  # shrinks the axes box, never clips data
     ax.grid(True, linestyle='--', alpha=0.4)
 
     # Robot marker
@@ -97,10 +100,12 @@ def draw_map(ax, detections, title="Ball positions"):
 
     for det in detections:
         style = BALL_STYLE.get(det['color'], dict(color='gray', label='?'))
-        ax.scatter(det['y_r'], det['x_r'],
+        plot_x = -det['y_r']   # negate: robot-left (+y_r) → screen-left (−x)
+        plot_y =  det['x_r']
+        ax.scatter(plot_x, plot_y,
                    color=style['color'], s=120, zorder=4,
                    edgecolors='black', linewidths=0.5)
-        ax.annotate(f"  {det['x_r']:.2f}m", (det['y_r'], det['x_r']),
+        ax.annotate(f"  {det['x_r']:.2f}m", (plot_x, plot_y),
                     fontsize=7, color=style['color'])
 
     # Legend
@@ -153,7 +158,7 @@ def make_summary_figure(by_frame, out_path):
     # Annotate frame numbers
     for frame_idx, dets in sorted(by_frame.items()):
         for det in dets:
-            ax.annotate(f"f{frame_idx}", (det['y_r'], det['x_r']),
+            ax.annotate(f"f{frame_idx}", (-det['y_r'], det['x_r']),
                         fontsize=6, alpha=0.5,
                         xytext=(4, 4), textcoords='offset points')
 

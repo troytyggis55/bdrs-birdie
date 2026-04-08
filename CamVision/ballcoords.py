@@ -31,17 +31,17 @@ DIST_COEFFS = np.array([-6.83778602e-02,  9.19338829e-01,
                           5.58258911e-04, -1.68054345e-03,
                          -1.11717796e+00])
 
-# Physical ball radius [m].
+# Physical ball *RADIUS* [m].
 # Measure the actual ball with a ruler.
-R_REAL = 0.045   # 3 cm — placeholder
+R_REAL = 0.025   # 3 cm — placeholder
 
 # Camera mounting on the robot.
 # PHI: downward tilt of the camera from horizontal [radians].
 # C_XR: forward offset of camera from robot origin [m].
 # C_ZR: vertical offset of camera from robot origin [m].
 PHI  = np.radians(11)   # ~11° tilt downward
-C_XR = 0.05             # camera is 5 cm in front of robot origin  [m]
-C_ZR = 0.10             # camera is 10 cm above robot origin        [m]
+C_XR = 0.0             # camera is 5 cm in front of robot origin  [m]
+C_ZR = 0.18             # camera is 10 cm above robot origin        [m]
 
 # Camera matrix (built once for use with cv2 functions).
 _CAMERA_MATRIX = np.array([[F_X,  0,  C_X],

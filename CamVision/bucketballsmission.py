@@ -1,6 +1,6 @@
 import time as t
 import os
-import datetime
+from datetime import datetime
 
 from uservice import service
 from sedge import edge
@@ -77,7 +77,7 @@ def bucketballsmission(start_state=0, target_color="B"):
 
     ballmap_dir = "VisionOutput/BallMap"
     os.makedirs(ballmap_dir, exist_ok=True)
-    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     ballmap_log = f"{ballmap_dir}/run_{run_id}.csv"
     with open(ballmap_log, 'w') as f:
         f.write("frame,timestamp,color,x_r,y_r,z_r\n")
