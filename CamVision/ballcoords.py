@@ -22,14 +22,14 @@ import numpy as np
 # Camera intrinsics (pixels).
 # Get these from cv2.calibrateCamera() with a checkerboard pattern.
 # Placeholder: approximate values for Pi Camera v2 at 820×616.
-F_X = 700.0   # focal length, horizontal  [px]
-F_Y = 700.0   # focal length, vertical    [px]
-C_X = 410.0   # optical center, x         [px]  (≈ image_width / 2)
-C_Y = 308.0   # optical center, y         [px]  (≈ image_height / 2)
+F_X = 625.48093855   # focal length, horizontal  [px]
+F_Y = 622.73549921   # focal length, vertical    [px]
+C_X = 406.10757421   # optical center, x         [px]  (≈ image_width / 2)
+C_Y = 324.93561895   # optical center, y         [px]  (≈ image_height / 2)
 
 # Physical ball radius [m].
 # Measure the actual ball with a ruler.
-R_REAL = 0.030   # 3 cm — placeholder
+R_REAL = 0.045   # 3 cm — placeholder
 
 # Camera mounting on the robot.
 # PHI: downward tilt of the camera from horizontal [radians].

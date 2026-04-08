@@ -1,14 +1,39 @@
 import time as t
 import os
+import datetime
 
 from uservice import service
 from sedge import edge
 from spose import pose
 from scam import cam
 
-from CamVision.visualcontrol import * 
+from CamVision.visualcontrol import *
 from CamVision.bucketballsyolo import *
 from CamVision.pictures import *
+from CamVision.ballcoords import pixels_to_robot_coords
+
+def _log_detections(frame, frame_idx, log_path):
+    """
+    Scans the full frame for both ball colors, converts detections to robot-frame
+    coordinates, and appends one CSV row per found ball to log_path.
+    Runs independently of the control loop — safe to call every N frames.
+    """
+    timestamp = t.time()
+    rows = []
+    for color in ('B', 'R'):
+        found, ball = localize_ball_lowest_contour(frame, color=color)
+        if found:
+            cX, cY = ball['center']
+            x, y, w, h = ball['rect']
+            r_px = min(w, h) / 2.0
+            coords = pixels_to_robot_coords([(cX, cY, r_px)])
+            if coords:
+                x_r, y_r, z_r = coords[0]
+                rows.append(f"{frame_idx},{timestamp:.3f},{color},{x_r:.4f},{y_r:.4f},{z_r:.4f}\n")
+    if rows:
+        with open(log_path, 'a') as f:
+            f.writelines(rows)
+
 
 Kp_turn = 0.010  # Adjusts how fast the robot spins to center the ball
 Kp_fwd  = 0.020  # Adjusts how fast the robot drives toward the ball
@@ -48,8 +73,16 @@ def bucketballsmission(start_state=0, target_color="B"):
 
    ######## FOR DEBUGGING
     debug_dir = "VisionOutput/Debug_mission"
-    if not os.path.exists(debug_dir):
-        os.makedirs(debug_dir)
+    os.makedirs(debug_dir, exist_ok=True)
+
+    ballmap_dir = "VisionOutput/BallMap"
+    os.makedirs(ballmap_dir, exist_ok=True)
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ballmap_log = f"{ballmap_dir}/run_{run_id}.csv"
+    with open(ballmap_log, 'w') as f:
+        f.write("frame,timestamp,color,x_r,y_r,z_r\n")
+    print(f"% BallMap log: {ballmap_log}")
+
     frame_idx = 0
    # ########################
     prev_error_y = 0
@@ -133,8 +166,9 @@ def bucketballsmission(start_state=0, target_color="B"):
                 ####### FOR DEBUGGING: every 10 frames save images with information about ball
                 ####### NOTE: Recording/saving images decreses FPS, which decreases control performance
                 if frame_idx % 10 == 0:
-                    cv.imwrite(f"{debug_dir}/{frame_idx:04d}_align.jpg", 
+                    cv.imwrite(f"{debug_dir}/{frame_idx:04d}_align.jpg",
                                 create_debug_view(img, ball, target_color))
+                    _log_detections(img, frame_idx, ballmap_log)
                 #############################
 
 
@@ -161,6 +195,7 @@ def bucketballsmission(start_state=0, target_color="B"):
                     print("% MISSION COMPLETE: Ball Reached.")
                     cv.imwrite(f"{debug_dir}/{frame_idx:04d}_final.jpg",
                                create_debug_view(img, ball, target_color))
+                    _log_detections(img, frame_idx, ballmap_log)
                     break
                 else:
                     # fwd_vel = Kp_fwd * error_y
@@ -176,8 +211,9 @@ def bucketballsmission(start_state=0, target_color="B"):
                 ####### FOR DEBUGGING: every 10 frames save images with information about ball
                 ####### NOTE: Recording/saving images decreses FPS, which decreases control performance
                 if frame_idx % 10 == 0:
-                    cv.imwrite(f"{debug_dir}/{frame_idx:04d}_track.jpg", 
+                    cv.imwrite(f"{debug_dir}/{frame_idx:04d}_track.jpg",
                                 create_debug_view(img, ball, target_color))
+                    _log_detections(img, frame_idx, ballmap_log)
                 #############################
 
 
