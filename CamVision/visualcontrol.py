@@ -127,25 +127,28 @@ def localize_ball_lowest_contour(frame, color='R'):
 
 
 
+COLOR_MAP = {'B': 'blue_ball', 'R': 'red_ball'}
+
 def localize_ball_yolo(frame, color="B"):
     """
-    Uses YOLO to find the ball. If multiple are found, picks the one 
+    Uses YOLO to find the ball. If multiple are found, picks the one
     lowest in the frame (closest to the robot).
     """
     # 1. Run YOLO inference
     results = get_labels(frame)
-    
+
     # 2. Extract boxes, confidences, and class IDs
     boxes = results.boxes
     found_balls = []
 
+    target_cls_name = COLOR_MAP.get(color.upper())
+
     for box in boxes:
-        # Get class name (e.g., 'red_ball' or 'blue_ball')
         cls_id = int(box.cls[0])
         cls_name = results.names[cls_id]
 
         # Only process the ball color we are looking for
-        if cls_name == color:
+        if cls_name == target_cls_name:
             # box.xyxy is [x1, y1, x2, y2]
             coords = box.xyxy[0].cpu().numpy()
             x1, y1, x2, y2 = coords

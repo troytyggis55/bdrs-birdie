@@ -343,7 +343,7 @@ class UService:
 
     # CRITICAL: CLOSE THE YOLO RECORDER
     try:
-      from CamVision.bucketballsyolo import close_recorder
+      from CamVision.pictures import close_recorder
       close_recorder()
     except Exception as e:
       print(f"% Could not close YOLO recorder: {e}")
