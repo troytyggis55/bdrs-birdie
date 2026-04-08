@@ -133,3 +133,68 @@ if cls_name.lower().startswith(color.lower()):
 - Debug frames saved to `VisionOutput/Debug_mission/`
 - Every 10 frames in states 1 & 2 (side-by-side: annotated frame | color mask)
 - `bucketballsmissionwithRec()` records video but kills FPS – do not use for real runs
+
+---
+
+## Next Integration: Pixel → Robot World Coordinates
+
+**Goal:** Convert ball detections `(x_pixel, y_pixel, r_pixel)` to `(x_r, y_r, z_r)` in the robot's coordinate frame (meters), to feed into EKF SLAM as landmark observations.
+
+### Chosen approach: manual numpy implementation
+No new library needed. ~25 lines of numpy. Transparent and easy to tune.
+Do **not** use `solvePnP` — that's for multi-point pose estimation, overkill here.
+Optional later: apply `cv2.undistortPoints()` before projection if lens distortion is measurable.
+
+### Pipeline
+
+**Step 1 — Pixel radius from detection**
+Current detections return bounding box `(x, y, w, h)`. Pixel radius: `r = min(w, h) / 2`.
+For better accuracy (off-center balls), use `cv2.minEnclosingCircle(contour)` instead.
+
+**Step 2 — Depth from known ball size**
+```python
+Z_a = (R_real * f_y) / r_pixel
+```
+
+**Step 3 — 3D camera coordinates**
+```python
+X_a = (x_pixel - cx) * Z_a / f_x
+Y_a = (y_pixel - cy) * Z_a / f_y
+```
+
+**Step 4 — Transform to robot frame**
+```python
+import numpy as np
+
+# Frame change: camera axes → robot axis convention
+# Camera Z (forward) → Robot X; Camera X → Robot -Y; Camera Y → Robot -Z
+F = np.array([[ 0,  0, 1, 0],
+              [-1,  0, 0, 0],
+              [ 0, -1, 0, 0],
+              [ 0,  0, 0, 1]])
+
+# Rotate (camera pitch phi) + translate (camera mounting offset)
+phi = np.radians(11)  # camera tilted downward ~11°
+T = np.array([[ np.cos(phi), 0, np.sin(phi), -c_xr],
+              [ 0,           1, 0,            0    ],
+              [-np.sin(phi), 0, np.cos(phi), -c_zr ],
+              [ 0,           0, 0,            1    ]])
+
+cam_point = np.array([X_a, Y_a, Z_a, 1])
+robot_point = T @ F @ cam_point
+x_r, y_r, z_r = robot_point[:3]
+```
+
+### Parameters to calibrate
+
+| Parameter | Description | How to get it |
+|-----------|-------------|---------------|
+| `f_x, f_y` | Focal lengths (pixels) | `cv2.calibrateCamera()` |
+| `c_x, c_y` | Optical center (pixels) | Same calibration |
+| `R_real` | Physical ball radius (m) | Measure |
+| `phi` | Camera tilt / pitch angle | Measure or calibrate |
+| `c_xr, c_zr` | Camera position relative to robot origin (m) | Measure from robot |
+
+### Where to add this
+New function `pixel_to_robot_coords(x_pixel, y_pixel, r_pixel, color)` in `CamVision/visualcontrol.py`.
+Call it from `bucketballsmission.py` after a successful detection in STATE 1/2 to produce the landmark observation.
