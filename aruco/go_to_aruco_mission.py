@@ -12,10 +12,13 @@ go_to_aruco_mission() directly).
 """
 
 import math
+import os
 import sys
 import threading
 import time as t
 from pathlib import Path
+
+import cv2
 
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO))
@@ -33,8 +36,10 @@ from odometry.graph_nav import graph_nav
 # Configuration — edit these before running
 # ---------------------------------------------------------------------------
 
-TARGET_MARKER_ID = 53       # ArUco marker ID to seek
-MARKER_SIZE_M    = 0.037    # Physical side length of the marker [m]
+TARGET_MARKER_ID = 53           # ArUco marker ID to seek
+MARKER_SIZE_M    = 0.037        # Physical side length of the marker [m]
+ARUCO_DICT       = "DICT_4X4_100"  # Must match the dictionary used to print the marker
+                                    # DICT_4X4_50 only has IDs 0-49; use 100/250 for higher IDs
 
 # ---------------------------------------------------------------------------
 # Pathfinding parameters
@@ -49,11 +54,14 @@ _CFG = PlannerConfig(
     smooth_path=True,
 )
 
-_STANDOFF_M       = 0.40   # stop this far in front of the marker [m]
-_SCAN_TURN_VEL    = 0.3    # turn rate while searching [rad/s]
-_MIN_DETECTIONS   = 5      # detections needed before position is trusted
-_EMA_ALPHA        = 0.3    # weight of each new measurement
-_MISSION_TIMEOUT_S = 90.0  # hard safety timeout [s]
+_STANDOFF_M        = 0.15   # stop this far in front of the marker [m]
+_SCAN_TURN_VEL     = 0.3    # turn rate while searching [rad/s]
+_SCAN_PAUSE_S      = 0.15   # pause after stopping before grabbing detection frame [s]
+_MIN_DETECTIONS    = 5      # detections needed before position is trusted
+_EMA_ALPHA         = 0.3    # weight of each new measurement
+_MISSION_TIMEOUT_S = 90.0   # hard safety timeout [s]
+_DEBUG_DIR         = "VisionOutput/Debug_aruco"
+_DEBUG_EVERY_N     = 20     # save a debug frame every N frames
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -151,7 +159,10 @@ class _ArucoWorldModel:
 
 def _run_vision_thread(model: _ArucoWorldModel, stop_event: threading.Event) -> None:
     """Grab frames continuously and feed ArUco detections into the world model."""
+    os.makedirs(_DEBUG_DIR, exist_ok=True)
     cam.setup_raw()
+
+    frame_idx = 0
 
     while not stop_event.is_set():
         ok, img, _ = cam.getRawFrame()
@@ -159,12 +170,24 @@ def _run_vision_thread(model: _ArucoWorldModel, stop_event: threading.Event) -> 
             t.sleep(0.05)
             continue
 
-        markers, _ = detect_aruco(img)
+        # Picamera2 XBGR8888 may return 4 channels — drop the padding channel first.
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
 
+        # Picamera2 returns RGB; OpenCV and ArUco detector expect BGR.
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        frame_idx += 1
+        save_debug = (frame_idx % _DEBUG_EVERY_N == 0)
+
+        markers, _, annotated = detect_aruco(img, dictionary_name=ARUCO_DICT, draw=True)
+
+        target_found = False
         for m in markers:
             if m["id"] != TARGET_MARKER_ID:
                 continue
 
+            target_found = True
             result = aruco_to_robot_frame(m, MARKER_SIZE_M)
             if result is None:
                 continue
@@ -172,6 +195,19 @@ def _run_vision_thread(model: _ArucoWorldModel, stop_event: threading.Event) -> 
             x_r, y_r, face_nx, face_ny = result
             rx, ry, hdg = pose.pose[0], pose.pose[1], pose.pose[2]
             model.update(x_r, y_r, face_nx, face_ny, rx, ry, hdg)
+
+        if save_debug:
+            snap = model.snapshot()
+            status = (
+                f"id:{TARGET_MARKER_ID} {'FOUND' if target_found else 'not seen'}  "
+                f"det:{snap['count']}  "
+                f"pos:({snap['x']:.2f},{snap['y']:.2f})"
+                if snap['x'] is not None
+                else f"id:{TARGET_MARKER_ID} {'FOUND' if target_found else 'not seen'}  det:{snap['count']}"
+            )
+            cv2.putText(annotated, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.imwrite(f"{_DEBUG_DIR}/{frame_idx:05d}.jpg", annotated)
 
         t.sleep(0.05)   # ~20 Hz
 
@@ -231,6 +267,8 @@ def go_to_aruco_mission() -> None:
 
     try:
         # ── Phase 1: SCAN ──────────────────────────────────────────────
+        # Rotate in short bursts, stopping briefly for each detection attempt.
+        # Continuous rotation causes motion blur that prevents ArUco detection.
         print("% GoToArucoMission: scanning for marker…")
         while not service.stop:
             if t.monotonic() - mission_start > _MISSION_TIMEOUT_S:
@@ -246,8 +284,11 @@ def go_to_aruco_mission() -> None:
                       f"detections={snap['count']}")
                 break
 
+            # Short rotation burst, then pause for a clean frame.
             service.send("robobot/cmd/ti", f"rc 0 {_SCAN_TURN_VEL:.3f}")
-            t.sleep(0.1)
+            t.sleep(0.3)
+            _stop()
+            t.sleep(_SCAN_PAUSE_S)
 
         if service.stop or not model.reliable:
             return
