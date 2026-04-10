@@ -45,6 +45,7 @@ from CamVision.pictures import *
 from CamVision.bucketballsyolo import *
 from CamVision.visualcontrol import *
 from CamVision.bucketballsmission import *
+from pathfinding.simulate_ball_mission import simulate_ball_mission
 
 ############################################################
 
@@ -220,7 +221,9 @@ def loop():
     state = 1900
   elif service.args.bucketballsmission:
     state = 2000
-  
+  elif service.args.simulate_ball:
+    state = 2100
+
   elif service.args.usestate > 0:
     state = service.args.usestate
   print(f"% Starting at state {state}")
@@ -382,6 +385,10 @@ def loop():
       bucketballsmission(target_color=service.args.bucketballsmission)
       #bucketballsmissionwithRec(target_color=service.args.bucketballsmission)
       #close_recorder()
+      state = 100
+
+    elif state == 2100:
+      simulate_ball_mission()
       state = 100
 
 

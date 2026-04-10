@@ -120,7 +120,10 @@ class UService:
     self.parser.add_argument('-bbm', '--bucketballsmission', type=str, choices=['R', 'B', 'r', 'b'],
                             help='Robot locates balls and goes forward: use "R" for Red or "B" for Blue')
 
-    
+    self.parser.add_argument('-sb', '--simulate-ball', action='store_true',
+                            help='Simulated ball delivery mission: pick up red then blue, deliver both to goal zone')
+
+
     self.args = self.parser.parse_args()
     # if not isinstance(self.args.usestate, int):
     #   self.args.usestate = int(0)
