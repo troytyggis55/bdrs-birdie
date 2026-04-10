@@ -123,6 +123,9 @@ class UService:
     self.parser.add_argument('-sb', '--simulate-ball', action='store_true',
                             help='Simulated ball delivery mission: pick up red then blue, deliver both to goal zone')
 
+    self.parser.add_argument('-ga', '--go-to-aruco', action='store_true',
+                            help='Search for a target ArUco marker and drive 40 cm in front of it')
+
 
     self.args = self.parser.parse_args()
     # if not isinstance(self.args.usestate, int):

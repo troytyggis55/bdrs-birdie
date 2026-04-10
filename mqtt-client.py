@@ -46,6 +46,7 @@ from CamVision.bucketballsyolo import *
 from CamVision.visualcontrol import *
 from CamVision.bucketballsmission import *
 from pathfinding.simulate_ball_mission import simulate_ball_mission
+from aruco.go_to_aruco_mission import go_to_aruco_mission
 
 ############################################################
 
@@ -223,6 +224,8 @@ def loop():
     state = 2000
   elif service.args.simulate_ball:
     state = 2100
+  elif service.args.go_to_aruco:
+    state = 2200
 
   elif service.args.usestate > 0:
     state = service.args.usestate
@@ -389,6 +392,10 @@ def loop():
 
     elif state == 2100:
       simulate_ball_mission()
+      state = 100
+
+    elif state == 2200:
+      go_to_aruco_mission()
       state = 100
 
 

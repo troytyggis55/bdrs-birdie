@@ -17,12 +17,12 @@ import threading
 import time as t
 from pathlib import Path
 
-# Make pathfinding modules importable regardless of working directory
-sys.path.insert(0, str(Path(__file__).parent))
+# Make repo root importable regardless of working directory
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pathfinding import CircleObstacle, PlannerConfig, find_safe_start
-from realtime_pathfind import RealtimePathfinder
-from pathfind_logger import PathfindLogger
+from pathfinding.pathfinding import CircleObstacle, PlannerConfig, find_safe_start
+from pathfinding.realtime_pathfind import RealtimePathfinder
+from pathfinding.pathfind_logger import PathfindLogger
 
 from spose import pose
 from sir import ir

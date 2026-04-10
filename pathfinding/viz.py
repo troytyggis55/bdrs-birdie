@@ -31,10 +31,10 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pathfinding import CircleObstacle, Obstacle, PlannerConfig, WallObstacle, bounds_from_scene
-from realtime_pathfind import PlannerState, RealtimePathfinder
+from pathfinding.pathfinding import CircleObstacle, Obstacle, PlannerConfig, WallObstacle, bounds_from_scene
+from pathfinding.realtime_pathfind import PlannerState, RealtimePathfinder
 
 # ---------------------------------------------------------------------------
 # Colour palette

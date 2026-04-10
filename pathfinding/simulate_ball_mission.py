@@ -26,13 +26,12 @@ import time as t
 from enum import Enum, auto
 from pathlib import Path
 
-# Make sibling packages importable regardless of working directory.
+# Make repo root importable regardless of working directory.
 _REPO = Path(__file__).parent.parent
-sys.path.insert(0, str(Path(__file__).parent))   # pathfinding/
-sys.path.insert(0, str(_REPO))                    # repo root
+sys.path.insert(0, str(_REPO))
 
-from pathfinding import CircleObstacle, PlannerConfig, find_safe_start
-from realtime_pathfind import RealtimePathfinder
+from pathfinding.pathfinding import CircleObstacle, PlannerConfig, find_safe_start
+from pathfinding.realtime_pathfind import RealtimePathfinder
 
 from worldmodel.ball_world_model import BallWorldModel
 from CamVision.visualcontrol import localize_ball_yolo

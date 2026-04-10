@@ -32,7 +32,7 @@ Design notes
 import time
 from dataclasses import dataclass
 
-from pathfinding import CircleObstacle, Obstacle, PlannerConfig, WallObstacle, dist, has_line_of_sight, plan_path
+from pathfinding.pathfinding import CircleObstacle, Obstacle, PlannerConfig, WallObstacle, dist, has_line_of_sight, plan_path
 
 
 @dataclass
