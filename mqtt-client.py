@@ -166,17 +166,17 @@ def driveToLine():
 
 ####################################################################3
 
-def driveTurnPi():
+def driveTurnPiX2():
   state = 0
   pose.tripBreset()
   print("% Driving a Pi turn -------------------------")
   service.send("robobot/cmd/T0","leds 16 0 100 0") # green
   while not (service.stop):
     if state == 0: # wait for start signal
-      service.send("robobot/cmd/ti","rc 0.2 0.5") # (forward m/s, turn-rate rad/sec)
+      service.send("robobot/cmd/ti","rc 0.0 0.5") # (forward m/s, turn-rate rad/sec)
       state = 1
     elif state == 1:
-      if pose.tripBh > 3.14 or pose.tripBtimePassed() > 15:
+      if pose.tripBh > 2 * np.pi or pose.tripBtimePassed() > 15:
         service.send("robobot/cmd/ti","rc 0.0 0.0") # (forward m/s, turn-rate rad/sec)
         state = 2
       pass
@@ -272,7 +272,7 @@ def loop():
       driveOneMeter();
       state = 100
     elif state == 102:
-      driveTurnPi();
+      driveTurnPiX2();
       state = 100
     elif state == 103:
       driveToLine()
