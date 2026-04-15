@@ -126,6 +126,9 @@ class UService:
     self.parser.add_argument('-ga', '--go-to-aruco', action='store_true',
                             help='Search for a target ArUco marker and drive 40 cm in front of it')
 
+    self.parser.add_argument('-fb', '--final-ball', action='store_true',
+                            help='Final ball mission')
+
 
     self.args = self.parser.parse_args()
     # if not isinstance(self.args.usestate, int):
