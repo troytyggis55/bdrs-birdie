@@ -8,7 +8,8 @@ Setup
 
 Sequence
 --------
-1. SCAN  — rotate until both balls are localised via YOLO.
+1. SCAN  — stop-and-look scan: stop, grab fresh frame, run YOLO for both
+           colors, rotate a small step, repeat until both balls are localised.
 2. Approach red ball (blue = pathfinding obstacle), stop 20 cm in front.
 3. WAIT  — camera watches; when red ball disappears for 3 s the human has
            "picked it up".  Robot drives to goal zone (blue still an obstacle).
@@ -19,6 +20,7 @@ Run via mqtt-client.py by adding a --simulate-ball flag (or call
 simulate_ball_mission() directly).
 """
 
+import cv2 as cv
 import math
 import sys
 import threading
@@ -60,7 +62,9 @@ _STANDOFF_M       = 0.20   # stop this far in front of a ball [m]
 _OBS_BALL_RADIUS  = 0.08   # obstacle radius used in pathfinder for balls [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
 _PICKUP_TIMEOUT_S = 30.0   # max wait for human pickup before aborting [s]
-_SCAN_TURN_VEL    = 0.3    # turn rate during SCAN phase [rad/s]
+# Scan step: same pulse used in bucketballsmission (0.5 rad/s for 0.2 s ≈ 5.7°)
+_SCAN_PULSE_VEL   = 0.5    # turn rate during each scan pulse [rad/s]
+_SCAN_PULSE_S     = 0.2    # duration of each scan pulse [s]
 _MISSION_TIMEOUT_S = 120.0 # hard safety timeout for entire mission [s]
 
 
@@ -88,16 +92,71 @@ def _approach_point(ball_x: float, ball_y: float,
     return ball_x - standoff * dx / dist, ball_y - standoff * dy / dist
 
 
-def _dist(ax: float, ay: float, bx: float, by: float) -> float:
-    return math.hypot(ax - bx, ay - by)
-
-
 def _stop() -> None:
     service.send("robobot/cmd/ti", "rc 0 0")
 
 
 def _led(r: int, g: int, b: int) -> None:
     service.send("robobot/cmd/T0", f"leds 16 {r} {g} {b}")
+
+
+def _grab_bgr():
+    """Grab one fresh frame from the camera. Returns (ok, bgr_img)."""
+    ok, img, _ = cam.getRawFrame()
+    if not ok or img is None:
+        return False, None
+    return True, cv.cvtColor(img, cv.COLOR_RGB2BGR)
+
+
+def _detect_and_update(img, world_model: BallWorldModel) -> None:
+    """
+    Run YOLO for both ball colors on *img* and update the world model.
+    Mirrors the per-frame logic from bucketballsmission.
+    """
+    rx, ry = _pos()
+    hdg = _heading()
+    for color in ('R', 'B'):
+        ball = world_model.get(color)
+        if ball and ball.collected:
+            continue
+        found, det = localize_ball_yolo(img, color)
+        if not found:
+            continue
+        cx, cy = det['center']
+        _, _, w, h = det['rect']
+        r_px = min(w, h) / 2.0
+        coords = pixels_to_robot_coords([(cx, cy, r_px)])
+        if not coords:
+            continue
+        x_r, y_r, _ = coords[0]
+        world_model.update(color, x_r, y_r, rx, ry, hdg)
+        est = world_model.get(color)
+        print(f"% Vision: {color} detected  center=({cx},{cy})  "
+              f"robot=({x_r:.2f},{y_r:.2f})  count={est.detection_count}")
+
+
+def _detect_color(img, color: str, world_model: BallWorldModel) -> bool:
+    """
+    Run YOLO for a single *color* and update the world model.
+    Returns True if the ball was found.
+    """
+    ball = world_model.get(color)
+    if ball and ball.collected:
+        return False
+    found, det = localize_ball_yolo(img, color)
+    if not found:
+        return False
+    cx, cy = det['center']
+    _, _, w, h = det['rect']
+    r_px = min(w, h) / 2.0
+    coords = pixels_to_robot_coords([(cx, cy, r_px)])
+    if not coords:
+        return False
+    x_r, y_r, _ = coords[0]
+    rx, ry = _pos()
+    hdg = _heading()
+    world_model.update(color, x_r, y_r, rx, ry, hdg)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -150,62 +209,19 @@ def _plan_and_drive(goal: tuple[float, float],
 
 
 # ---------------------------------------------------------------------------
-# Vision thread
-# ---------------------------------------------------------------------------
-
-def _run_vision_thread(world_model: BallWorldModel,
-                       stop_event: threading.Event) -> None:
-    """
-    Continuously grab frames and update the world model with YOLO detections.
-    Runs as a daemon thread alongside the mission state machine.
-    """
-    cam.setup_raw()
-
-    while not stop_event.is_set():
-        ok, img, _ = cam.getRawFrame()
-        if not ok or img is None:
-            t.sleep(0.05)
-            continue
-
-        rx, ry, hdg = pose.pose[0], pose.pose[1], pose.pose[2]
-
-        for color in ('R', 'B'):
-            ball = world_model.get(color)
-            if ball and ball.collected:
-                continue
-
-            found, det = localize_ball_yolo(img, color)
-            if not found:
-                continue
-
-            cx, cy = det['center']
-            _, _, w, h = det['rect']
-            r_px = min(w, h) / 2.0
-
-            coords = pixels_to_robot_coords([(cx, cy, r_px)])
-            if not coords:
-                continue
-
-            x_r, y_r, _ = coords[0]
-            world_model.update(color, x_r, y_r, rx, ry, hdg)
-
-        t.sleep(0.05)   # ~20 Hz vision update
-
-
-# ---------------------------------------------------------------------------
 # Mission states
 # ---------------------------------------------------------------------------
 
 class _State(Enum):
-    SCAN            = auto()
-    NAVIGATE_TO_RED = auto()
-    WAIT_RED_PICKUP = auto()
-    DELIVER_RED     = auto()
+    SCAN             = auto()
+    NAVIGATE_TO_RED  = auto()
+    WAIT_RED_PICKUP  = auto()
+    DELIVER_RED      = auto()
     NAVIGATE_TO_BLUE = auto()
     WAIT_BLUE_PICKUP = auto()
-    DELIVER_BLUE    = auto()
-    DONE            = auto()
-    FAILED          = auto()
+    DELIVER_BLUE     = auto()
+    DONE             = auto()
+    FAILED           = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +240,8 @@ def simulate_ball_mission() -> None:
     service.send("robobot/cmd/T0", "enc0")
     t.sleep(0.2)
 
+    cam.setup_raw()
+
     x0, y0 = _pos()
     h0 = _heading()
     goal = (
@@ -234,14 +252,6 @@ def simulate_ball_mission() -> None:
           f"hdg={math.degrees(h0):.1f}°  goal=({goal[0]:.3f},{goal[1]:.3f})")
 
     world_model = BallWorldModel(colors=('R', 'B'))
-    vision_stop = threading.Event()
-    vision_thread = threading.Thread(
-        target=_run_vision_thread,
-        args=(world_model, vision_stop),
-        daemon=True,
-    )
-    vision_thread.start()
-
     mission_start = t.monotonic()
     state = _State.SCAN
 
@@ -254,6 +264,16 @@ def simulate_ball_mission() -> None:
 
             # ----------------------------------------------------------
             if state == _State.SCAN:
+                # Stop-and-look: identical pattern to bucketballsmission state 0.
+                # Stop the robot, wait for vibration to settle, grab a fresh
+                # frame, run YOLO for both colors, then rotate a small step.
+                _stop()
+                t.sleep(0.1)   # mechanical settle
+
+                ok, img = _grab_bgr()
+                if ok:
+                    _detect_and_update(img, world_model)
+
                 if world_model.all_reliable():
                     _stop()
                     r = world_model.get('R')
@@ -262,9 +282,11 @@ def simulate_ball_mission() -> None:
                           f"R=({r.x:.2f},{r.y:.2f})  B=({b.x:.2f},{b.y:.2f})")
                     state = _State.NAVIGATE_TO_RED
                 else:
+                    # Small rotation pulse then loop back
                     service.send("robobot/cmd/ti",
-                                 f"rc 0 {_SCAN_TURN_VEL:.3f}")
-                    t.sleep(0.1)
+                                 f"rc 0 {_SCAN_PULSE_VEL:.3f}")
+                    t.sleep(_SCAN_PULSE_S)
+                    _stop()
 
             # ----------------------------------------------------------
             elif state == _State.NAVIGATE_TO_RED:
@@ -292,12 +314,16 @@ def simulate_ball_mission() -> None:
                         print("% SimBallMission: pickup timeout")
                         state = _State.FAILED
                         break
+                    # Inline vision: keep world model fresh so absent_for()
+                    # correctly measures time since the ball was last seen.
+                    ok, img = _grab_bgr()
+                    if ok:
+                        _detect_color(img, 'R', world_model)
                     if world_model.absent_for('R') >= _PICKUP_ABSENT_S:
                         world_model.mark_collected('R')
                         print("% SimBallMission: red ball collected")
                         state = _State.DELIVER_RED
                         break
-                    t.sleep(0.1)
 
             # ----------------------------------------------------------
             elif state == _State.DELIVER_RED:
@@ -336,12 +362,14 @@ def simulate_ball_mission() -> None:
                         print("% SimBallMission: pickup timeout")
                         state = _State.FAILED
                         break
+                    ok, img = _grab_bgr()
+                    if ok:
+                        _detect_color(img, 'B', world_model)
                     if world_model.absent_for('B') >= _PICKUP_ABSENT_S:
                         world_model.mark_collected('B')
                         print("% SimBallMission: blue ball collected")
                         state = _State.DELIVER_BLUE
                         break
-                    t.sleep(0.1)
 
             # ----------------------------------------------------------
             elif state == _State.DELIVER_BLUE:
@@ -362,8 +390,6 @@ def simulate_ball_mission() -> None:
                 break
 
     finally:
-        vision_stop.set()
-        vision_thread.join(timeout=1.0)
         _stop()
 
     if state == _State.DONE:

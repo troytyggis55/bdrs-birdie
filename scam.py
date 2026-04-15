@@ -66,9 +66,13 @@ class SCam:
       print(f"% SCam:: Failed to open hardware: {e}")
 
   def getRawFrame(self):
-    """Captures frame in ~33ms"""
+    """Captures frame in ~33ms, always returns 3-channel RGB."""
     if self.pc2:
-      self.savedFrame = self.pc2.capture_array()
+      frame = self.pc2.capture_array()
+      # Picamera2 may return RGBX/RGBA (4 channels); strip the unused channel
+      if frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame[:, :, :3]
+      self.savedFrame = frame
       self.frameTime = datetime.now()
       return True, self.savedFrame, self.frameTime
     return False, None, datetime.now()
