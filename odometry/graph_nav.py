@@ -55,7 +55,7 @@ class GraphNav:
     # ------------------------------------------------------------------
     def _get_pose(self, zero_x=0.0, zero_y=0.0):
         """Return current (x, y, heading_rad) with tuning scales applied."""
-        print(f"XY H pose (raw): {pose.pose[0]:.3f}, {pose.pose[1]:.3f}, {math.degrees(pose.pose[2]):.1f}°")
+        #print(f"XY H pose (raw): {pose.pose[0]:.3f}, {pose.pose[1]:.3f}, {math.degrees(pose.pose[2]):.1f}°")
         return pose.pose[0] - zero_x, pose.pose[1] - zero_y, pose.pose[2]
 
     # ------------------------------------------------------------------
