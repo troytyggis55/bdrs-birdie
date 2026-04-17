@@ -61,19 +61,18 @@ _CFG = PlannerConfig(
     smooth_path=True,
 )
 
-_STANDOFF_M       = 0.20   # stop this far in front of a ball [m]
+_NAV_STANDOFF_M   = 0.30   # pathfinding approach point: this far behind the ball [m]
+_FINE_STANDOFF_M  = 0.20   # fine-approach stop distance [m]
 _OBS_BALL_RADIUS  = 0.08   # obstacle radius for other balls in pathfinder [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
 _PICKUP_TIMEOUT_S = 30.0   # max wait for pickup before aborting [s]
-_SCAN_PULSE_VEL   = 0.5    # turn rate during each scan pulse [rad/s]
+_SCAN_PULSE_VEL   = 2      # turn rate during each scan pulse [rad/s]
 _SCAN_PULSE_S     = 0.2    # duration of each scan pulse [s]
 _MISSION_TIMEOUT_S = 120.0
 _MAX_REPLAN_CYCLES = 99999
 _POLL_INTERVAL_S   = 0.50
 _REPLAN_DIST_M     = 0.05
-_LOST_BALL_TIMEOUT_S = 5.0
 _CAM_FOV_HALF_RAD  = math.radians(33)
-_CLOSE_RANGE_M     = 0.25
 _KP_TURN_FINE      = 0.010
 _KP_FWD_FINE       = 0.30
 _FINE_ALIGN_TOL_PX = 5
@@ -88,10 +87,7 @@ _ARUCO_MARKER_SIZE_M = 0.10   # physical side length [m] — matches CLAUDE.md
 _ARUCO_ID_MIN = 10            # ignore markers outside this range (reduces noise)
 _ARUCO_ID_MAX = 17
 
-_ROTATE_ALIGN_TOL_PX = 20    # pixel tolerance for heading-align step [px]
-_ROTATE_STEP_VEL     = 0.40  # rotation speed during heading-align [rad/s]
-_ROTATE_STEP_S       = 0.12  # duration of each rotation pulse [s]
-_ROTATE_MAX_STEPS    = int(math.pi / (_ROTATE_STEP_VEL * _ROTATE_STEP_S)) + 2  # ≈ 180°
+_ROTATE_STEP_VEL = 1  # rotation speed during heading-align [rad/s]
 
 # Classical tracking FOV guard
 _IMG_WIDTH              = 820   # camera frame width (pixels)
@@ -100,7 +96,7 @@ _TRACKING_FOV_X_MARGIN  = 100   # classical track invalid when ball centre is wi
                                 # only re-enter classical tracking after a YOLO rescan
 
 # Debug image capture
-_IMG_LOG_EVERY_N = 10   # save an annotated frame every N classical-tracker iterations
+_IMG_LOG_EVERY_N = 2   # save an annotated frame every N classical-tracker iterations
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (set by final_ball_mission() at start)
@@ -136,7 +132,7 @@ def _heading() -> float:
 
 def _approach_point(ball_x: float, ball_y: float,
                     robot_x: float, robot_y: float,
-                    standoff: float = _STANDOFF_M) -> tuple[float, float]:
+                    standoff: float = _NAV_STANDOFF_M) -> tuple[float, float]:
     """Return the point *standoff* metres behind the ball on the robot→ball line."""
     dx = ball_x - robot_x
     dy = ball_y - robot_y
@@ -149,7 +145,7 @@ def _approach_point(ball_x: float, ball_y: float,
 def _approach_point_wall_aware(
     ball_x: float, ball_y: float,
     robot_x: float, robot_y: float,
-    standoff: float = _STANDOFF_M,
+    standoff: float = _NAV_STANDOFF_M,
 ) -> tuple[float, float]:
     """
     Compute the pathfinding approach point for a ball.
@@ -179,55 +175,46 @@ def _approach_point_wall_aware(
     return _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
 
 
-def _rotate_to_face_ball(target_color: str) -> bool:
+def _rotate_to_face_ball(target_color: str, world_model: BallWorldModel) -> bool:
     """
-    Stop and rotate until *target_color* is centred in the camera frame
-    (within _ROTATE_ALIGN_TOL_PX pixels of horizontal centre).
+    Rotate to face the ball using the world-model estimate, then confirm with YOLO.
 
-    Uses classical detection (localize_ball_lowest_contour) since we are
-    close to the ball; falls back to YOLO if classical fails.  Rotates up
-    to ~180° searching before giving up.
-
-    Called after pathfinding navigation completes, before fine approach.
+    1. Compute bearing to ball's last known world position; rotate open-loop.
+    2. Take one stationary YOLO scan to confirm.
     """
     _stop()
     t.sleep(0.1)
-    print(f"% FinalBallMission: rotate-to-face {target_color}")
 
-    for step in range(_ROTATE_MAX_STEPS):
-        if service.stop:
-            return False
+    # ── 1. Odometry-based rotation ────────────────────────────────────────
+    ball = world_model.get(target_color)
+    if ball is not None:
+        rx, ry = _pos()
+        hdg = _heading()
+        bearing = math.atan2(ball.y - ry, ball.x - rx)
+        delta = _angle_wrap(bearing - hdg)
+        print(f"% FinalBallMission: rotate-to-face {target_color}: "
+              f"delta={math.degrees(delta):.1f}°  "
+              f"ball=({ball.x:.2f},{ball.y:.2f})  hdg={math.degrees(hdg):.1f}°")
+        if abs(delta) > math.radians(3):
+            turn_vel = _ROTATE_STEP_VEL if delta > 0 else -_ROTATE_STEP_VEL
+            service.send("robobot/cmd/ti", f"rc 0 {turn_vel:.3f}")
+            t.sleep(abs(delta) / _ROTATE_STEP_VEL)
+            _stop()
+            t.sleep(0.1)
+    else:
+        print(f"% FinalBallMission: rotate-to-face {target_color}: "
+              f"no world-model estimate — skipping odometry rotation")
 
-        ok, img = _grab_bgr()
-        if not ok:
-            t.sleep(0.05)
-            continue
-
-        found, ball_data = localize_ball_lowest_contour(img, target_color)
-        if not found:
-            found, ball_data = localize_ball_yolo(img, target_color)
-
+    # ── 2. Single YOLO confirmation ───────────────────────────────────────
+    ok, img = _grab_bgr()
+    if ok:
+        _scan_aruco_passive(img)
+        found, _ = localize_ball_yolo(img, target_color)
         if found:
-            cx, _ = ball_data['center']
-            error_x = _CAM_CX - cx   # positive = ball to the left → turn CCW (+)
-            if abs(error_x) < _ROTATE_ALIGN_TOL_PX:
-                _stop()
-                print(f"% FinalBallMission: aligned to {target_color}  "
-                      f"err_x={int(error_x)} px  steps={step}")
-                return True
-            turn_sign = 1.0 if error_x > 0 else -1.0
-        else:
-            turn_sign = 1.0   # sweep if ball not visible
+            print(f"% FinalBallMission: rotate-to-face {target_color}: confirmed by YOLO")
+            return True
 
-        service.send("robobot/cmd/ti",
-                     f"rc 0 {turn_sign * _ROTATE_STEP_VEL:.3f}")
-        t.sleep(_ROTATE_STEP_S)
-        _stop()
-        t.sleep(0.05)
-
-    _stop()
-    print(f"% FinalBallMission: rotate-to-face {target_color} gave up after "
-          f"{_ROTATE_MAX_STEPS} steps")
+    print(f"% FinalBallMission: rotate-to-face {target_color}: not visible after rotation")
     return False
 
 
@@ -607,8 +594,8 @@ def _scan_aruco_passive(img) -> None:
 
 def _fine_approach(target_color: str, world_model: BallWorldModel) -> bool:
     """
-    Classical-CV tight control loop for the final ~_CLOSE_RANGE_M to the ball.
-    Stops at _STANDOFF_M in front of the ball.
+    Classical-CV tight control loop for the final approach to the ball.
+    Stops at _FINE_STANDOFF_M in front of the ball.
     """
     print(f"% FinalBallMission: fine approach to {target_color}")
     _stop()
@@ -658,7 +645,7 @@ def _fine_approach(target_color: str, world_model: BallWorldModel) -> bool:
         actual_dist = math.hypot(x_r, y_r)
 
         error_x    = _CAM_CX - cX
-        error_dist = actual_dist - _STANDOFF_M
+        error_dist = actual_dist - _FINE_STANDOFF_M
 
         _log_pose_maybe()
 
@@ -793,15 +780,13 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
             return False
 
         rx, ry = _pos()
-        if math.hypot(ball.x - rx, ball.y - ry) <= _CLOSE_RANGE_M:
-            _rotate_to_face_ball(target_color)
-            return _fine_approach(target_color, world_model)
-
         approach = _approach_point_wall_aware(ball.x, ball.y, rx, ry)
         plan_bx, plan_by = ball.x, ball.y
 
-        # Build obstacle list: other ball + all known arena walls
-        obstacles: list = []
+        # Build obstacle list: target ball + other ball + all known arena walls.
+        # The target ball must be an obstacle so the planner routes around it to
+        # reach the approach point (which is on the far side of the ball).
+        obstacles: list = [CircleObstacle(ball.x, ball.y, _OBS_BALL_RADIUS)]
         if obstacle_color:
             obs_est = world_model.get(obstacle_color)
             if obs_est and not obs_est.collected:
@@ -864,15 +849,6 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                         break
 
                     _log_pose_maybe()
-                    rx, ry = _pos()
-                    ball = world_model.get(target_color)
-
-                    # ── Close-range hand-off ───────────────────────────────
-                    if ball and math.hypot(ball.x - rx, ball.y - ry) <= _CLOSE_RANGE_M:
-                        graph_nav._stop_nav.set()
-                        nav_thread.join()
-                        outcome = 'close'
-                        break
 
                     # ── Replan if world model estimate has shifted ─────────
                     if tracker.pop_detected():
@@ -887,42 +863,6 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                                 outcome = 'replan'
                                 break
 
-                    # ── FOV-loss: classical tracker needs YOLO reconfirmation ──
-                    if tracker.is_needs_yolo():
-                        print(f"% FinalBallMission: {target_color} left classical FOV — "
-                              f"stopping nav for YOLO reconfirmation")
-                        graph_nav._stop_nav.set()
-                        nav_thread.join()
-                        _stop()
-                        t.sleep(0.1)
-                        ok, img = _grab_bgr()
-                        found_by_yolo = False
-                        if ok:
-                            _scan_aruco_passive(img)
-                            found_by_yolo = _detect_color(img, target_color, world_model)
-                            if _logger is not None:
-                                lbl = (f"YOLO_RECONFIRM_{'FOUND' if found_by_yolo else 'LOST'}"
-                                       f"_{target_color}")
-                                ann = _annotate_frame(img, label=lbl)
-                                _logger.log_frame(ann, label=lbl.lower())
-                        if found_by_yolo:
-                            print(f"% FinalBallMission: {target_color} reconfirmed by YOLO "
-                                  f"— replanning")
-                            tracker.revalidate()
-                            outcome = 'replan'
-                        else:
-                            print(f"% FinalBallMission: {target_color} not found after "
-                                  f"FOV loss — rotation scan")
-                            outcome = 'lost'
-                        break
-
-                    # ── Lost-ball fallback ────────────────────────────────
-                    if world_model.absent_for(target_color) > _LOST_BALL_TIMEOUT_S:
-                        graph_nav._stop_nav.set()
-                        nav_thread.join()
-                        outcome = 'lost'
-                        break
-
                 if outcome != 'done' or service.stop:
                     break
 
@@ -935,16 +875,11 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
         if service.stop:
             return False
 
-        if outcome in ('close', 'done'):
-            _rotate_to_face_ball(target_color)
+        if outcome == 'done':
+            _rotate_to_face_ball(target_color, world_model)
             return _fine_approach(target_color, world_model)
 
         if outcome == 'replan':
-            continue
-
-        if outcome == 'lost':
-            if not _rotation_scan(target_color, world_model):
-                return False
             continue
 
     print(f"% FinalBallMission: exceeded {_MAX_REPLAN_CYCLES} replan cycles for {target_color}")
