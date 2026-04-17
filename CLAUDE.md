@@ -1,9 +1,17 @@
 # BDRS Birdie – Vision & Control Loop Reference
 
+
 ## Project Overview
 Two-wheeled robot that uses hybrid YOLO + classical vision to detect colored balls (red/blue) and drive toward them. MQTT is the communication layer between the Python vision controller and the Teensy hardware.
 
 **Current main goal:** `final_ball_mission.py` — pick up a red ball and deliver it to quadrant A, pick up a blue ball and deliver it to quadrant C, then return to start. ArUco markers on the quadrant walls serve as localization landmarks throughout.
+
+## TODOs
+- The "plus" is off by 45° for some reason. Right now the plus walls seem to be parallel to the outer perimeter walls, but they should be rotated 45° so they are parallel to the A–C and B–D axes.
+- [] The goal nav standoff is supposed to be at the best relative position, but its honestly quite bad. Probably still better than arbitrary fixed standoff, but it could with another simple heuristic like just shortest path to the ball.
+- [] We need more image frame logging. Right now its only for yolo and classical during pathinding. I want it to log for basically every part of the mission.
+- [] The yolo might still catch onto noise like the lower gripper or other things in the distance. Maybe we need to crop the image fed to the yolo, or ignore values outside a given fov margin.
+- [] We need a safe reverse routine after delivering the ball into the quadrant, so we dont rotate and crash into the wall.
 
 ---
 
