@@ -18,6 +18,7 @@ mission log for post-run replay.
 Log written to MissionLogs/ball_mission_<timestamp>.log
 Replay:  python ball_mission/final_ball_replay.py [log_path]
 """
+from json.encoder import INFINITY
 
 import cv2 as cv
 import math
@@ -52,28 +53,26 @@ from odometry.graph_nav import graph_nav
 
 _CFG = PlannerConfig(
     delta=0.15,
-    goal_tolerance=0.12,
+    goal_tolerance=0.1,
     clearance=0.00,
-    robot_radius=0.12,
+    robot_radius=0.2,
     max_steps=3000,
     smooth_path=True,
 )
 
-_GOAL_DIST_M      = 2.00   # goal zone distance ahead of start [m]
-_GOAL_RADIUS_M    = 0.15   # goal zone radius [m]
-_STANDOFF_M       = 0.30   # stop this far in front of a ball [m]
+_STANDOFF_M       = 0.20   # stop this far in front of a ball [m]
 _OBS_BALL_RADIUS  = 0.08   # obstacle radius for other balls in pathfinder [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
 _PICKUP_TIMEOUT_S = 30.0   # max wait for pickup before aborting [s]
 _SCAN_PULSE_VEL   = 0.5    # turn rate during each scan pulse [rad/s]
 _SCAN_PULSE_S     = 0.2    # duration of each scan pulse [s]
 _MISSION_TIMEOUT_S = 120.0
-_MAX_REPLAN_CYCLES = 5
+_MAX_REPLAN_CYCLES = 99999
 _POLL_INTERVAL_S   = 0.50
 _REPLAN_DIST_M     = 0.05
 _LOST_BALL_TIMEOUT_S = 5.0
 _CAM_FOV_HALF_RAD  = math.radians(33)
-_CLOSE_RANGE_M     = 0.70
+_CLOSE_RANGE_M     = 0.25
 _KP_TURN_FINE      = 0.010
 _KP_FWD_FINE       = 0.30
 _FINE_ALIGN_TOL_PX = 5
