@@ -52,17 +52,18 @@ from odometry.graph_nav import graph_nav
 # ---------------------------------------------------------------------------
 
 _CFG = PlannerConfig(
-    delta=0.05,
+    delta=0.1,
     goal_tolerance=0.1,
     clearance=0.00,
-    robot_radius=0.15,
+    robot_radius=0.16,
     max_steps=3000,
-    smooth_path=True,
+    clearance_weight=0.01,  # > 0 biases path away from obstacles
+    smooth_path=False,
 )
 
-_NAV_STANDOFF_M   = 0.30   # pathfinding approach point: this far behind the ball [m]
-_FINE_STANDOFF_M  = 0.25   # fine-approach stop distance [m]
-_OBS_BALL_RADIUS  = 0.08   # obstacle radius for other balls in pathfinder [m]
+_NAV_STANDOFF_M   = 0.4   # pathfinding approach point: this far behind the ball [m]
+_FINE_STANDOFF_M  = 0.3   # fine-approach stop distance [m]
+_OBS_BALL_RADIUS  = 0.06   # obstacle radius for other balls in pathfinder [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
 _PICKUP_TIMEOUT_S = 30.0   # max wait for pickup before aborting [s]
 _SCAN_PULSE_VEL   = 2      # turn rate during each scan pulse [rad/s]
@@ -87,6 +88,9 @@ _ARUCO_ID_MIN = 10            # ignore markers outside this range (reduces noise
 _ARUCO_ID_MAX = 17
 
 _ROTATE_STEP_VEL = 1  # rotation speed during heading-align [rad/s]
+
+# Classical tracking sanity
+_JUMP_THRESHOLD_M       = 1  # world-model shift that triggers YOLO sanity check [m]
 
 # Classical tracking FOV guard
 _IMG_WIDTH              = 820   # camera frame width (pixels)
@@ -338,6 +342,7 @@ class _ClassicalTracker:
         self._stop_event = threading.Event()
         self._detected = threading.Event()
         self._needs_yolo = threading.Event()   # set when ball exits FOV margin
+        self._jump_detected = threading.Event()  # set when estimate jumps > threshold
         self._frame_cnt = 0
         self._thread: threading.Thread | None = None
 
@@ -345,6 +350,7 @@ class _ClassicalTracker:
         self._stop_event.clear()
         self._detected.clear()
         self._needs_yolo.clear()
+        self._jump_detected.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -369,10 +375,28 @@ class _ClassicalTracker:
         self._needs_yolo.clear()
         print(f"% FinalBallMission: Tracker [{self._color}]: revalidated by YOLO")
 
+    def is_jump_detected(self) -> bool:
+        """True when the tracker blocked an update due to a large position jump."""
+        return self._jump_detected.is_set()
+
+    def resolve_jump(self, accepted: bool) -> None:
+        """
+        Call from the main loop after a YOLO sanity check.
+        *accepted* — True if YOLO confirmed the new position (world model already
+        updated by caller); False if YOLO failed and the pre-jump estimate is kept.
+        """
+        self._jump_detected.clear()
+        verdict = "accepted" if accepted else "rejected (pre-jump estimate kept)"
+        print(f"% FinalBallMission: Tracker [{self._color}]: jump {verdict}")
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             # Dormant: wait for YOLO revalidation before resuming classical updates
             if self._needs_yolo.is_set():
+                t.sleep(self._INTERVAL_S)
+                continue
+            # Dormant: wait for main loop to resolve the jump before resuming
+            if self._jump_detected.is_set():
                 t.sleep(self._INTERVAL_S)
                 continue
 
@@ -406,6 +430,21 @@ class _ClassicalTracker:
                     x_r, y_r, _ = coords[0]
                     rx, ry = _pos()
                     hdg = _heading()
+
+                    # Jump guard: check how far the new world-frame estimate is
+                    # from the current one before committing the update.
+                    current = self._wm.get(self._color)
+                    if current is not None and not current.collected:
+                        new_wx = rx + x_r * math.cos(hdg) - y_r * math.sin(hdg)
+                        new_wy = ry + x_r * math.sin(hdg) + y_r * math.cos(hdg)
+                        jump = math.hypot(new_wx - current.x, new_wy - current.y)
+                        if jump > _JUMP_THRESHOLD_M:
+                            print(f"% FinalBallMission: Tracker [{self._color}]: "
+                                  f"jump {jump:.2f} m detected — suspending for YOLO check")
+                            self._jump_detected.set()
+                            t.sleep(self._INTERVAL_S)
+                            continue   # skip this update entirely
+
                     self._wm.update(self._color, x_r, y_r, rx, ry, hdg)
                     est = self._wm.get(self._color)
                     if _logger is not None and est is not None:
@@ -920,6 +959,7 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                     daemon=True,
                 )
                 nav_thread.start()
+                jump_handled = False  # reset per waypoint attempt
 
                 while nav_thread.is_alive() and not service.stop:
                     nav_thread.join(timeout=_POLL_INTERVAL_S)
@@ -927,6 +967,48 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                         break
 
                     _log_pose_maybe()
+
+                    # ── Jump sanity check ─────────────────────────────────
+                    if tracker.is_jump_detected():
+                        print(f"% FinalBallMission: {target_color} tracker jump — "
+                              f"stopping for YOLO sanity check")
+                        graph_nav._stop_nav.set()
+                        nav_thread.join()
+                        _stop()
+                        t.sleep(0.1)
+                        yolo_ok, yolo_img = _grab_bgr()
+                        if yolo_ok:
+                            _scan_aruco_passive(yolo_img)
+                            yolo_found, yolo_det = localize_ball_yolo(yolo_img, target_color)
+                            if yolo_found:
+                                ycx, ycy = yolo_det['center']
+                                _, _, yw, yh = yolo_det['rect']
+                                yr_px = min(yw, yh) / 2.0
+                                ycoords = pixels_to_robot_coords([(ycx, ycy, yr_px)])
+                                if ycoords:
+                                    yx_r, yy_r, _ = ycoords[0]
+                                    rx_now, ry_now = _pos()
+                                    hdg_now = _heading()
+                                    world_model.update(target_color, yx_r, yy_r,
+                                                       rx_now, ry_now, hdg_now)
+                                    tracker.resolve_jump(accepted=True)
+                                    tracker.revalidate()
+                                    # Only replan if YOLO confirms a significantly shifted position
+                                    ball_confirmed = world_model.get(target_color)
+                                    if (ball_confirmed is not None and
+                                            math.hypot(ball_confirmed.x - plan_bx,
+                                                       ball_confirmed.y - plan_by) > _REPLAN_DIST_M):
+                                        outcome = 'replan'
+                                        break
+                                else:
+                                    tracker.resolve_jump(accepted=False)
+                            else:
+                                tracker.resolve_jump(accepted=False)
+                        else:
+                            tracker.resolve_jump(accepted=False)
+                        # Jump resolved — resume current waypoint
+                        jump_handled = True
+                        break
 
                     # ── Replan if world model estimate has shifted ─────────
                     if tracker.pop_detected():
@@ -943,6 +1025,9 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
 
                 if outcome != 'done' or service.stop:
                     break
+
+                if jump_handled:
+                    continue  # retry same waypoint with fresh nav_thread
 
                 wp_idx += 1
 

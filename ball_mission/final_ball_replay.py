@@ -60,7 +60,6 @@ C_RED_BALL  = "#e03030"
 C_BLUE_BALL = "#2060d0"
 C_ARUCO     = "#00aaaa"
 C_WALL      = "#006060"   # dark teal — inferred arena wall segments
-C_WALL_PERP = "#008888"   # slightly lighter for the perpendicular wall
 C_PERIM     = "#8844aa"   # purple — perimeter walls
 C_BUCKET    = "#cc6600"   # orange — bucket obstacle
 
@@ -98,32 +97,6 @@ ARUCO_QUADRANT = {mid: q for q, ids in ARENA_QUADRANTS.items() for mid in ids}
 # Wall geometry (mirrors arena_walls.py — inlined to keep replay standalone)
 # ---------------------------------------------------------------------------
 
-def _walls_from_aruco_world(
-    marker_id: int, wx: float, wy: float, fnx_w: float, fny_w: float
-) -> list[tuple]:
-    """
-    Return [(x1,y1,x2,y2), (x1,y1,x2,y2)] for the two wall segments
-    inferred from a single ArUco world-frame detection.
-    Segment 0 = wall the marker sits on; Segment 1 = perpendicular inner wall.
-    """
-    # Right-wall markers (odd IDs): mirror the along-wall direction
-    if marker_id % 2 == 1:
-        tx, ty = fny_w, -fnx_w   # 90° CW
-    else:
-        tx, ty = -fny_w, fnx_w   # 90° CCW
-
-    # Wall the marker is on (60 cm: 13 cm before → 47 cm after)
-    seg0 = (wx - 0.13 * tx, wy - 0.13 * ty,
-            wx + 0.47 * tx, wy + 0.47 * ty)
-
-    # Perpendicular inner wall (centred 17 cm along t, spans ±30 cm along n)
-    cx = wx + 0.17 * tx
-    cy = wy + 0.17 * ty
-    seg1 = (cx - 0.30 * fnx_w, cy - 0.30 * fny_w,
-            cx + 0.30 * fnx_w, cy + 0.30 * fny_w)
-
-    return [seg0, seg1]
-
 
 def _ec_from_marker_replay(
     marker_id: int, fnx: float, fny: float
@@ -139,19 +112,21 @@ def _ec_from_marker_replay(
         return fny, -fnx
 
 
-def _perimeter_from_estimates(
+def _arena_geometry_from_estimates(
     estimates: dict[int, tuple],
-) -> tuple[list[tuple], tuple | None]:
+) -> tuple[tuple | None, list[tuple], list[tuple], tuple | None]:
     """
-    Return perimeter wall segments and bucket position from EMA marker estimates.
+    Compute unified arena geometry from EMA marker estimates.
 
-    estimates : marker_id → (wx, wy, fnx_w, fny_w)
-    Returns ([(x1,y1,x2,y2), ...], (bx, by)) or ([], None).
+    Returns (plus_center, inner_segs, perim_segs, bucket_pos).
+      plus_center : (x, y) or None
+      inner_segs  : 2 segments forming the inner cross (each 60 cm)
+      perim_segs  : [c_wall, d_wall] segments
+      bucket_pos  : (x, y) or None
     """
     if not estimates:
-        return [], None
+        return None, [], [], None
 
-    # Average plus-center
     plus_pts = []
     ec_vecs = []
     for mid, (wx, wy, fnxw, fnyw) in estimates.items():
@@ -169,24 +144,29 @@ def _perimeter_from_estimates(
     sy = sum(v[1] for v in ec_vecs) / len(ec_vecs)
     mag = math.hypot(sx, sy)
     if mag < 1e-3:
-        return [], None
+        return (pcx, pcy), [], [], None
     ec_x, ec_y = sx / mag, sy / mag
-    ed_x, ed_y = -ec_y, ec_x   # ê_D = 90° CCW rotation of ê_C
+    ed_x, ed_y = -ec_y, ec_x   # ê_D = 90° CCW of ê_C
+
+    plus_center = (pcx, pcy)
+
+    # Inner cross: two 60 cm walls through plus-center
+    inner_segs = [
+        (pcx - 0.30 * ec_x, pcy - 0.30 * ec_y,
+         pcx + 0.30 * ec_x, pcy + 0.30 * ec_y),
+        (pcx - 0.30 * ed_x, pcy - 0.30 * ed_y,
+         pcx + 0.30 * ed_x, pcy + 0.30 * ed_y),
+    ]
 
     def _to_world(lx, ly):
         return (pcx + lx * ed_x - ly * ec_x,
                 pcy + lx * ed_y - ly * ec_y)
 
-    p1 = _to_world(*_C_WALL_P1)
-    p2 = _to_world(*_C_WALL_P2)
-    c_wall = (*p1, *p2)
-
-    p1 = _to_world(*_D_WALL_P1)
-    p2 = _to_world(*_D_WALL_P2)
-    d_wall = (*p1, *p2)
-
+    c_wall = (*_to_world(*_C_WALL_P1), *_to_world(*_C_WALL_P2))
+    d_wall = (*_to_world(*_D_WALL_P1), *_to_world(*_D_WALL_P2))
     bucket_pos = _to_world(*_BUCKET_XY)
-    return [c_wall, d_wall], bucket_pos
+
+    return plus_center, inner_segs, [c_wall, d_wall], bucket_pos
 
 
 def _ema_aruco_up_to(
@@ -607,29 +587,26 @@ class BallMissionReplay:
                         fontsize=9, color=style['color'], fontweight='bold')
             all_x.extend(wxs); all_y.extend(wys)
 
-        # ── Arena walls inferred from EMA ArUco estimates ─────────────
+        # ── Arena walls (unified geometry from current ArUco estimates) ──
         wall_estimates = _ema_aruco_up_to(self._d['arucos'], self._t)
-        wall_drawn_ids: set = set()
-        for mid, (wx, wy, fnxw, fnyw) in wall_estimates.items():
-            segs = _walls_from_aruco_world(mid, wx, wy, fnxw, fnyw)
-            for i, (x1, y1, x2, y2) in enumerate(segs):
-                color = C_WALL if i == 0 else C_WALL_PERP
-                lbl = 'Arena walls' if (not wall_drawn_ids and i == 0) else None
-                ax.plot([x1, x2], [y1, y2], '-',
-                        color=color, linewidth=3.5, zorder=3,
-                        alpha=0.75, solid_capstyle='round',
-                        label=lbl)
-                wall_drawn_ids.add(mid)
-            all_x += [wx]; all_y += [wy]
+        plus_center, inner_segs, perim_segs, bucket_pos = \
+            _arena_geometry_from_estimates(wall_estimates)
 
-        # ── Perimeter walls + bucket ─────────────────────────────────
-        perim_segs, bucket_pos = _perimeter_from_estimates(wall_estimates)
+        for i, (x1, y1, x2, y2) in enumerate(inner_segs):
+            ax.plot([x1, x2], [y1, y2], '-',
+                    color=C_WALL, linewidth=3.5, zorder=3,
+                    alpha=0.75, solid_capstyle='round',
+                    label='Arena walls' if i == 0 else None)
+        if plus_center:
+            all_x.append(plus_center[0]); all_y.append(plus_center[1])
+
         for i, (x1, y1, x2, y2) in enumerate(perim_segs):
-            lbl = 'Perimeter walls' if i == 0 else None
             ax.plot([x1, x2], [y1, y2], '-',
                     color=C_PERIM, linewidth=2.5, zorder=3,
-                    alpha=0.80, solid_capstyle='round', label=lbl)
+                    alpha=0.80, solid_capstyle='round',
+                    label='Perimeter walls' if i == 0 else None)
             all_x += [x1, x2]; all_y += [y1, y2]
+
         if bucket_pos is not None:
             bx, by = bucket_pos
             ax.add_patch(mpatches.Circle(

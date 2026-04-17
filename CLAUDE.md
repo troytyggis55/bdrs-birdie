@@ -26,7 +26,10 @@ Two-wheeled robot that uses hybrid YOLO + classical vision to detect colored bal
 ### Missions
 | File | Role |
 |------|------|
-| `ball_mission/final_ball_mission.py` | **Primary mission** — deliver red→A, blue→C using ArUco landmarks |
+| `ball_mission/final_ball_mission.py` | **Primary mission** — deliver closest ball first, then second; red→A, blue→C |
+| `ball_mission/arena_walls.py` | `ArenaWallModel` — EMA wall model from ArUco; `walls_from_aruco_world()` geometry |
+| `ball_mission/final_ball_logger.py` | `FinalBallLogger` — timestamped event logger; saves frames to `MissionLogs/` |
+| `ball_mission/final_ball_replay.py` | Replay script: reconstruct path/ball/ArUco from log file |
 | `pathfinding/simulate_ball_mission.py` | Older simulated mission (reference for nav+tracker patterns) |
 
 ### Pathfinding & Navigation
@@ -112,32 +115,31 @@ Bucket: A circular obstacle positioned 1.02m to the left of the plus center (dee
 
 ### Ball Approach Strategy
 
-Three rules that reduce pathfinding failures near walls:
-
 **1. ArUco ID filter**
-Only markers with IDs 10–17 (the 8 inner-wall markers) are logged and used for wall mapping.  All others (test targets, calibration boards, etc.) are silently ignored.  Implemented as `_is_arena_aruco()` in `final_ball_mission.py`.
+Only markers with IDs 10–17 (the 8 inner-wall markers) are logged and used for wall mapping. All others are silently ignored. Implemented as `_is_arena_aruco()` in `final_ball_mission.py`.
 
-**2. Wall-aware pathfinding goal**
-When `ArenaWallModel` has at least one qualified marker (≥ 2 detections):
-- Compute the plus-center from the wall model.
-- Place the pathfinding approach point on the **far side of the ball from the plus-center**: `approach = ball + standoff · normalize(ball − plus_center)`.
-- This ensures the ball is always between the robot and the inner walls, so the planner targets open space outside the arena rather than the tight gap between ball and wall.
-
-If no wall data exists, falls back to the standard robot-relative approach (`_approach_point`).  Implemented in `_approach_point_wall_aware()`.
+**2. Clearance-maximising approach point**
+`_best_approach_point()` samples 36 directions around the ball and picks the standoff point (`_NAV_STANDOFF_M = 0.4 m`) with maximum clearance from walls, other balls, and the bucket. Falls back to the robot-relative direction when no obstacles are present.
 
 **3. Rotate-to-face before fine approach**
-After pathfinding navigation reaches the approach point (or triggers the close-range hand-off), the robot:
-1. Stops.
-2. Rotates in small pulses until the ball is centred within `_ROTATE_ALIGN_TOL_PX = 20 px` (uses classical HSV detection first, YOLO fallback).  Searches up to ~180°.
+After navigation reaches the approach point, `_rotate_to_face_ball()`:
+1. Computes bearing to the ball's last known world position and rotates open-loop.
+2. Takes one stationary YOLO scan to confirm.
 3. Hands off to `_fine_approach()` (classical P-control to 30 cm).
 
-Implemented in `_rotate_to_face_ball()`, called from every exit path out of the navigation loop in `_navigate_to_ball()`.
+**4. Classical tracker guards**
+
+*FOV edge guard:* If the tracked ball's pixel centre is within `_TRACKING_FOV_X_MARGIN = 150 px` of the left/right edge, `_ClassicalTracker` suspends world-model updates and sets `_needs_yolo`. The main loop must stop the robot, run a YOLO scan, and call `revalidate()` before classical tracking resumes.
+
+*Jump guard:* If a new world-frame estimate would shift the ball position by more than `_JUMP_THRESHOLD_M = 0.30 m`, the tracker sets `_jump_detected` and goes dormant (stops processing frames). The main loop stops navigation, runs one YOLO scan, calls `resolve_jump()`, then resumes the current waypoint. A full replan is triggered only if the YOLO-confirmed position differs from the original plan by more than `_REPLAN_DIST_M`.
 
 **Delivery targets:**
 - Red ball → **Quadrant A** (IDs 10, 11)
 - Blue ball → **Quadrant C** (IDs 14, 15)
 
-**ArUco geometry:** `marker_size_m = 0.10`. The goal point for entering a quadrant is computed as `standoff_m` in front of the marker face, using `aruco_to_robot_frame()` which returns `(x_r, y_r, face_nx, face_ny)`. Goal 40 cm in front: `(x_r + 0.40*face_nx, y_r + 0.40*face_ny)`.
+**Second-ball navigation:** `_navigate_to_second_ball()` drives to the last-known world position. When within `_YOLO_CONFIRM_DIST_M = 1.0 m`, it stops, runs `_rotate_to_face_ball()` + YOLO confirm, then hands off to `_navigate_to_ball()`. Falls back to a full `_rotation_scan()` if YOLO fails.
+
+**ArUco geometry:** `marker_size_m = 0.10`. Delivery goal: `_DELIVERY_STANDOFF_M = 0.35 m` in front of the ArUco marker face normal, computed via `aruco_to_robot_frame()` → `(x_r, y_r, face_nx, face_ny)`.
 
 ---
 
@@ -175,7 +177,7 @@ The robot has a **front servo** (servo ID 1) that controls a ball holder/scoop a
 
 ---
 
-## final_ball_mission — Design Plan
+## final_ball_mission — Implementation
 
 ### Ball Setup
 - 4 balls knocked from a cup at mission start: 1 red, 1 blue, 2 white (ignored)
@@ -185,42 +187,47 @@ The robot has a **front servo** (servo ID 1) that controls a ball holder/scoop a
 ### High-Level State Machine
 
 ```
-SCAN_FOR_BALLS
-  Servo neutral. Stop-and-look rotation until red and blue are localised.
-  Also scan for any visible ArUco markers → use as initial pose correction.
+SCAN
+  Servo neutral. YOLO stop-and-look pulses until red and blue are localised.
+  Passive ArUco scan on every stopped frame → wall model.
+  After both balls found (or timeout), pick the closest one first.
 
-PICKUP_RED
-  Navigate to 30 cm in front of red ball (odometry + _ClassicalTracker + fine-approach).
+NAVIGATE_TO_FIRST_BALL
+  _navigate_to_ball(first_color, second_color, world_model)
+  _ClassicalTracker + _PassiveArucoScanner run in background.
+  Fine approach stops at 30 cm.
+
+WAIT_FIRST_PICKUP
   Lower servo: servo 1 500 200.
-  Drive forward 30 cm to capture ball in holder.
-  Confirm pickup: ball absent from camera for ≥ 3 s.
+  Wait until ball absent for ≥ _PICKUP_ABSENT_S (3 s).
+  mark_collected(first_color).
 
-DELIVER_TO_A
-  Navigate to Quadrant A entrance using odometry + ArUco landmark correction.
-  Rotate to find ArUco ID 10 or 11; use aruco_to_robot_frame for precise positioning.
-  Drive to 30 cm in front of quadrant wall (ball holder tip inside opening).
-  Raise servo: servo 1 -800 300 → ball releases into quadrant.
-  Confirm delivery: ball absent from camera.
+DELIVER_FIRST
+  _navigate_to_delivery(first_color, world_model)
+  _PassiveArucoScanner refines delivery goal continuously.
+  Raise servo: servo 1 -800 300 → ball releases.
 
-PICKUP_BLUE
-  Lower servo. Navigate to blue ball. Fine-approach. Raise servo.
+NAVIGATE_TO_SECOND_BALL
+  Servo neutral (servo 1 0 0).
+  _navigate_to_second_ball(second_color, world_model)
+  Drives to last-known position → stops at 1 m → YOLO confirm → full approach.
 
-DELIVER_TO_C
-  Same as DELIVER_TO_A but target ArUco IDs 14/15.
+WAIT_SECOND_PICKUP / DELIVER_SECOND
+  Same as first ball.
 
 RETURN_TO_START
-  Servo neutral. Plan path back to (x0, y0).
+  Servo neutral. _plan_and_drive((x0, y0), []).
 
 DONE / FAILED
 ```
 
-### ArUco as Localization Landmarks
-Every ArUco detection during the mission gives an absolute robot-pose constraint:
-- `aruco_to_robot_frame(marker, marker_size_m=0.10)` → `(x_r, y_r, face_nx, face_ny)` in robot frame
-- Combined with the known world-frame position of the marker (derived from arena geometry + marker ID), this gives a corrected world-frame robot pose
-- Use this to correct odometry drift before replanning
-- Markers 10/11 fix the robot's position relative to Quadrant A; 14/15 relative to Quadrant C
-- During delivery, ArUco is the primary (not just corrective) navigation target — the robot homes directly onto the marker using `aruco_to_robot_frame` rather than relying on the odometry world model
+### ArUco as Localization
+ArUco sightings are accumulated passively throughout the mission via `_PassiveArucoScanner` (background thread while moving) and `_scan_aruco_passive()` (inline on stopped frames). Detections feed `ArenaWallModel` which provides:
+- Inner wall segments for pathfinding obstacle avoidance
+- Plus-center estimate for perimeter wall/bucket positioning
+- Delivery goal positions (average of target marker positions + face normal standoff)
+
+ArUco does **not** directly correct odometry pose in the current implementation; it informs obstacle geometry and delivery goals instead.
 
 ### White Balls
 Ignored for now. Future: treat as `CircleObstacle` with radius = 0.025 m if classical CV picks them up.
@@ -233,23 +240,24 @@ All mission events should be written to a timestamped log file for post-mission 
 
 **Inspired by:** `pathfinding/pathfind_logger.py` (event-based, space-separated, `#` comments), `CamVision/bucketballsmission.py` (per-frame vision state), `worldmodel/ball_world_model.py` (world-model state).
 
-**Log events to capture:**
+**Log events (implemented in `FinalBallLogger`):**
 
 | Event token | Fields |
 |-------------|--------|
-| `BM_START` | start_x start_y heading goal_A_id goal_C_id |
-| `BM_STATE` | new_state |
-| `BM_POSE` | x y heading (periodic ~5 Hz) |
+| `BM_START` | x0 y0 heading |
+| `BM_STATE` | state_name |
+| `BM_POSE` | x y heading (periodic, `_POSE_LOG_INTERVAL_S = 0.20 s`) |
 | `BM_BALL_DET` | color cx cy r_px x_r y_r wx wy det_count |
-| `BM_ARUCO` | marker_id x_r y_r fnx fny rx ry hdg (each ArUco sighting) |
-| `BM_POSE_CORRECT` | old_rx old_ry new_rx new_ry heading (after ArUco-based correction) |
+| `BM_ARUCO` | marker_id x_r y_r fnx fny rx ry hdg |
+| `BM_POSE_CORRECT` | old_rx old_ry new_rx new_ry heading |
 | `BM_PATH` | n x1 y1 x2 y2 … |
 | `BM_REPLAN` | reason eff_sx eff_sy n x1 y1 … |
 | `BM_PICKUP` | color elapsed_s |
 | `BM_DELIVER` | color quadrant |
 | `BM_DONE` | 1\|0 elapsed_s |
+| `BM_FRAME` | filename label (annotated JPEG saved to `<logname>_frames/`) |
 
-Log files go to `MissionLogs/` (one file per run, timestamped). A replay script should be able to reconstruct the robot path, ball estimates, and ArUco sightings from the log alone.
+Log files go to `MissionLogs/` (one per run, timestamped). Annotated frames are saved every `_IMG_LOG_EVERY_N = 2` classical-tracker iterations and on FOV-edge events. Replay: `python ball_mission/final_ball_replay.py [log_path]`.
 
 ---
 
@@ -314,12 +322,15 @@ EMA-smoothed world-frame position estimates for tracked ball colors.
 
 ---
 
-## simulate_ball_mission — Key Patterns (Reference)
+## final_ball_mission — Key Internal Patterns
 
-`pathfinding/simulate_ball_mission.py` contains the navigation scaffolding used as the basis for `final_ball_mission.py`:
+These patterns are all implemented in `ball_mission/final_ball_mission.py`:
 
-- `_ClassicalTracker` — background thread running `localize_ball_lowest_contour()` at ~10 Hz; updates world model continuously while driving
-- `_fine_approach()` — close-range P-control using `track_ball_window()` + `pixels_to_robot_coords()`; stops at `_STANDOFF_M = 0.30 m`
+- `_ClassicalTracker` — background thread running `localize_ball_lowest_contour()` at ~10 Hz while driving; updates world model; has FOV-edge guard (`_needs_yolo`) and jump guard (`_jump_detected`) — both pause the tracker until the main loop resolves them
+- `_PassiveArucoScanner` — background thread running `detect_aruco()` at ~10 Hz while driving; feeds `ArenaWallModel` and logs all arena markers; purely observational
+- `_fine_approach()` — close-range P-control using `track_ball_window()` + `pixels_to_robot_coords()`; stops at `_FINE_STANDOFF_M = 0.30 m`
 - `_rotation_scan()` — YOLO stop-and-look rotation up to 360° to relocate a lost target ball
-- `_navigate_to_ball()` — two-phase nav: poll `nav_thread.join(timeout=0.5s)` for mid-segment interruption; outcomes: `close` | `replan` | `lost` | `done`
-- Nav interruption via `graph_nav._stop_nav.set()` (threading.Event on `drive_to()`)
+- `_navigate_to_ball()` — two-phase nav: poll `nav_thread.join(timeout=_POLL_INTERVAL_S)` for mid-segment interruption; outcomes: `done` (→ fine approach) | `replan` (→ next cycle); nav interruption via `graph_nav._stop_nav.set()`
+- `_navigate_to_delivery()` — same waypoint loop but goal is refined by `_delivery_goal()` as new ArUco markers are seen; replans when goal shifts > `_REPLAN_DIST_M`
+
+`pathfinding/simulate_ball_mission.py` is an older version kept for reference only.
