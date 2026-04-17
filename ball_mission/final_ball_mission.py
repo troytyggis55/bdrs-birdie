@@ -1,19 +1,17 @@
 """
-Final ball mission — Phase 1 test build.
+Final ball mission — full implementation.
 
-Full mission plan (CLAUDE.md):
-  SCAN_FOR_BALLS → PICKUP_RED → DELIVER_TO_A → PICKUP_BLUE → DELIVER_TO_C → RETURN_TO_START
+State machine:
+  SCAN → NAVIGATE_TO_FIRST_BALL → WAIT_FIRST_PICKUP → DELIVER_FIRST
+       → NAVIGATE_TO_SECOND_BALL → WAIT_SECOND_PICKUP → DELIVER_SECOND
+       → RETURN_TO_START → DONE
 
-Current test build (Phase 1):
-  SCAN → NAVIGATE_TO_RED → DONE
-  Only the red-ball approach is active. Delivery and blue-ball states are
-  commented out at the bottom of final_ball_mission() — all the underlying
-  helpers (_fine_approach, _navigate_to_ball, etc.) remain intact and
-  fully logged so the replay tool shows the complete picture.
+The closest ball (red or blue) is picked up first and delivered to its
+quadrant (red→A via ArUco 10/11, blue→C via ArUco 14/15). The second
+ball is then confirmed with a YOLO scan at 1 m range before approach.
 
-ArUco markers are scanned passively throughout: during SCAN (inline, per frame)
-and during navigation (background thread). Every sighting is written to the
-mission log for post-run replay.
+ArUco markers are scanned passively throughout and used to continuously
+refine both the arena wall model and delivery goal points.
 
 Log written to MissionLogs/ball_mission_<timestamp>.log
 Replay:  python ball_mission/final_ball_replay.py [log_path]
@@ -98,6 +96,14 @@ _TRACKING_FOV_X_MARGIN  = 150   # classical track invalid when ball centre is wi
 
 # Debug image capture
 _IMG_LOG_EVERY_N = 2   # save an annotated frame every N classical-tracker iterations
+
+# Delivery
+_DELIVERY_IDS         = {'R': (10, 11), 'B': (14, 15)}   # ArUco IDs per quadrant
+_DELIVERY_STANDOFF_M  = 0.35   # stop this far from quadrant inner wall [m]
+_DELIVERY_QUADRANT    = {'R': 'A', 'B': 'C'}
+
+# Second-ball navigation
+_YOLO_CONFIRM_DIST_M  = 1.0    # YOLO-confirm second ball when within this range [m]
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (set by final_ball_mission() at start)
@@ -598,6 +604,51 @@ def _scan_aruco_passive(img) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Delivery goal computation
+# ---------------------------------------------------------------------------
+
+def _delivery_goal(color: str) -> tuple[float, float] | None:
+    """
+    World-frame approach point for delivering *color* to its quadrant.
+
+    Primary: average world-frame position of the two target ArUco markers,
+    offset _DELIVERY_STANDOFF_M along their face normal.
+    Fallback: plus-center ± ê_C × _DELIVERY_STANDOFF_M when no target markers
+    have been seen yet.
+    Returns None when no ArUco data is available at all.
+    """
+    if _wall_model is None:
+        return None
+    snap = _wall_model.get_snapshot()
+    target_ids = _DELIVERY_IDS[color]
+    candidates = [
+        (m['wx'], m['wy'], m['fnx'], m['fny'])
+        for mid, m in snap.items()
+        if mid in target_ids and m['count'] >= 2
+    ]
+    if candidates:
+        wx  = sum(c[0] for c in candidates) / len(candidates)
+        wy  = sum(c[1] for c in candidates) / len(candidates)
+        fnx = sum(c[2] for c in candidates) / len(candidates)
+        fny = sum(c[3] for c in candidates) / len(candidates)
+        mag = math.hypot(fnx, fny)
+        if mag > 1e-3:
+            fnx /= mag
+            fny /= mag
+        return wx + _DELIVERY_STANDOFF_M * fnx, wy + _DELIVERY_STANDOFF_M * fny
+
+    # Fallback: derive from plus-center + orientation
+    plus = _wall_model.get_plus_center()
+    ec   = _wall_model.get_ec_direction()
+    if plus is None or ec is None:
+        return None
+    if color == 'R':   # toward A = −ê_C
+        return plus[0] - _DELIVERY_STANDOFF_M * ec[0], plus[1] - _DELIVERY_STANDOFF_M * ec[1]
+    else:              # toward C = +ê_C
+        return plus[0] + _DELIVERY_STANDOFF_M * ec[0], plus[1] + _DELIVERY_STANDOFF_M * ec[1]
+
+
+# ---------------------------------------------------------------------------
 # Fine approach (classical CV P-control)
 # ---------------------------------------------------------------------------
 
@@ -914,21 +965,192 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
 
 
 # ---------------------------------------------------------------------------
+# Delivery navigation
+# ---------------------------------------------------------------------------
+
+def _navigate_to_delivery(color: str, world_model: BallWorldModel) -> bool:
+    """
+    Navigate to the delivery standoff point for *color*'s quadrant.
+
+    Runs _PassiveArucoScanner in background so the delivery goal is
+    continuously refined as new markers are seen. Replans when the goal
+    shifts by more than _REPLAN_DIST_M (same threshold as ball navigation).
+
+    Returns True when the robot has reached the delivery standoff point.
+    Raises servo at the call site — not here.
+    """
+    quadrant = _DELIVERY_QUADRANT[color]
+    other_color = 'B' if color == 'R' else 'R'
+    aruco_scanner = _PassiveArucoScanner()
+
+    for cycle in range(20):
+        goal = _delivery_goal(color)
+
+        if goal is None:
+            # No ArUco data yet — rotate one step and try again
+            _stop()
+            t.sleep(0.1)
+            ok, img = _grab_bgr()
+            if ok:
+                _scan_aruco_passive(img)
+            goal = _delivery_goal(color)
+            if goal is None:
+                if cycle >= 4:
+                    print(f"% FinalBallMission: cannot determine delivery goal for {color}")
+                    return False
+                service.send("robobot/cmd/ti", f"rc 0 {_SCAN_PULSE_VEL:.3f}")
+                t.sleep(_SCAN_PULSE_S)
+                _stop()
+                continue
+
+        plan_goal = goal
+
+        other = world_model.get(other_color)
+        obs: list = []
+        if other and not other.collected:
+            obs.append(CircleObstacle(other.x, other.y, _OBS_BALL_RADIUS))
+
+        all_obs = list(obs)
+        if _wall_model is not None:
+            all_obs.extend(_wall_model.get_walls())
+            perim, bucket = _wall_model.get_perimeter_obstacles()
+            all_obs.extend(perim)
+            if bucket is not None:
+                all_obs.append(bucket)
+
+        eff_start = find_safe_start(_pos(), goal, all_obs, _CFG)
+        planner   = RealtimePathfinder(goal=goal, cfg=_CFG, replan_cooldown=0.0)
+        state_p   = planner.update(eff_start, all_obs)
+
+        if not state_p.solved:
+            print(f"% FinalBallMission: delivery planning failed for {color} (cycle {cycle})")
+            _stop()
+            return False
+
+        path = state_p.path
+        if _logger is not None:
+            if cycle == 0:
+                _logger.log_path(path)
+            else:
+                _logger.log_replan(f"deliver_{color}_c{cycle}",
+                                   eff_start[0], eff_start[1], path)
+
+        print(f"% FinalBallMission: navigating to {quadrant} delivery "
+              f"({goal[0]:.2f},{goal[1]:.2f}), "
+              f"{len(path)} waypoints, {state_p.path_length:.2f} m (cycle {cycle})")
+
+        aruco_scanner.start()
+        outcome = 'done'
+        wp_idx  = 1
+
+        try:
+            while not service.stop and wp_idx < len(path):
+                tx, ty    = path[wp_idx]
+                has_next  = wp_idx + 1 < len(path)
+                nx = path[wp_idx + 1][0] if has_next else None
+                ny = path[wp_idx + 1][1] if has_next else None
+
+                graph_nav._stop_nav.clear()
+                nav_thread = threading.Thread(
+                    target=graph_nav.drive_to,
+                    args=(tx, ty, nx, ny, not has_next),
+                    daemon=True,
+                )
+                nav_thread.start()
+
+                while nav_thread.is_alive() and not service.stop:
+                    nav_thread.join(timeout=_POLL_INTERVAL_S)
+                    if not nav_thread.is_alive():
+                        break
+                    _log_pose_maybe()
+
+                    new_goal = _delivery_goal(color)
+                    if new_goal is not None:
+                        shift = math.hypot(new_goal[0] - plan_goal[0],
+                                           new_goal[1] - plan_goal[1])
+                        if shift > _REPLAN_DIST_M:
+                            print(f"% FinalBallMission: delivery goal shifted "
+                                  f"{shift:.3f} m — replanning")
+                            graph_nav._stop_nav.set()
+                            nav_thread.join()
+                            outcome = 'replan'
+                            break
+
+                if outcome != 'done' or service.stop:
+                    break
+                wp_idx += 1
+
+        finally:
+            aruco_scanner.stop()
+
+        if service.stop:
+            return False
+
+        if outcome == 'done':
+            return True
+        # outcome == 'replan': loop with refined goal
+
+    print(f"% FinalBallMission: delivery exceeded replan limit for {color}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Second-ball navigation (with 1 m YOLO confirmation)
+# ---------------------------------------------------------------------------
+
+def _navigate_to_second_ball(color: str, world_model: BallWorldModel) -> bool:
+    """
+    Navigate toward the second ball's last known world position. When within
+    _YOLO_CONFIRM_DIST_M, stop, rotate to face, and run a YOLO scan to confirm
+    the position before handing off to the full _navigate_to_ball approach.
+
+    Falls back to a rotation scan if YOLO does not find the ball, then fails
+    (caller should proceed to RETURN_TO_START).
+    """
+    ball = world_model.get(color)
+    if ball is None:
+        print(f"% FinalBallMission: no world-model estimate for second ball {color}")
+        return False
+
+    rx, ry = _pos()
+    dist   = math.hypot(ball.x - rx, ball.y - ry)
+
+    if dist > _YOLO_CONFIRM_DIST_M:
+        intermediate = _approach_point(ball.x, ball.y, rx, ry,
+                                       standoff=_YOLO_CONFIRM_DIST_M)
+        print(f"% FinalBallMission: driving to 1 m confirm point for {color} "
+              f"({intermediate[0]:.2f},{intermediate[1]:.2f})")
+        if not _plan_and_drive(intermediate, []):
+            return False
+
+    # Rotate to face + YOLO confirm
+    confirmed = _rotate_to_face_ball(color, world_model)
+    if not confirmed:
+        print(f"% FinalBallMission: YOLO did not confirm {color} — running rotation scan")
+        confirmed = _rotation_scan(color, world_model)
+
+    if not confirmed:
+        print(f"% FinalBallMission: second ball {color} not found — aborting")
+        return False
+
+    return _navigate_to_ball(color, None, world_model)
+
+
+# ---------------------------------------------------------------------------
 # Mission states
 # ---------------------------------------------------------------------------
 
 class _State(Enum):
-    SCAN             = auto()
-    NAVIGATE_TO_RED  = auto()
-    # ── Delivery and blue-ball states — commented out for Phase 1 testing ──
-    # WAIT_RED_PICKUP  = auto()
-    # DELIVER_RED      = auto()
-    # NAVIGATE_TO_BLUE = auto()
-    # WAIT_BLUE_PICKUP = auto()
-    # DELIVER_BLUE     = auto()
-    # RETURN_TO_START  = auto()
-    DONE             = auto()
-    FAILED           = auto()
+    SCAN                    = auto()
+    NAVIGATE_TO_FIRST_BALL  = auto()
+    WAIT_FIRST_PICKUP       = auto()
+    DELIVER_FIRST           = auto()
+    NAVIGATE_TO_SECOND_BALL = auto()
+    WAIT_SECOND_PICKUP      = auto()
+    DELIVER_SECOND          = auto()
+    RETURN_TO_START         = auto()
+    DONE                    = auto()
+    FAILED                  = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +1161,11 @@ def final_ball_mission() -> None:
     """
     Run the final ball mission.
     Called from mqtt-client.py.
+
+    State machine:
+      SCAN → NAVIGATE_TO_FIRST_BALL → WAIT_FIRST_PICKUP → DELIVER_FIRST
+           → NAVIGATE_TO_SECOND_BALL → WAIT_SECOND_PICKUP → DELIVER_SECOND
+           → RETURN_TO_START → DONE
     """
     global _logger, _last_pose_log, _wall_model
 
@@ -947,6 +1174,7 @@ def final_ball_mission() -> None:
 
     service.send("robobot/cmd/T0", "enc0")
     t.sleep(0.2)
+    service.send("robobot/cmd/T0", "servo 1 0 0")   # servo neutral at start
 
     cam.setup_raw()
 
@@ -961,10 +1189,12 @@ def final_ball_mission() -> None:
     print(f"% FinalBallMission: start=({x0:.3f},{y0:.3f})  hdg={math.degrees(h0):.1f}°")
     print(f"% FinalBallMission: log → {_logger.path}")
 
-    world_model = BallWorldModel(colors=('R', 'B'))
+    world_model   = BallWorldModel(colors=('R', 'B'))
     mission_start = t.monotonic()
-    scan_start = mission_start
-    state = _State.SCAN
+    scan_start    = mission_start
+    state         = _State.SCAN
+    first_color: str = 'R'   # determined at end of SCAN
+    second_color: str = 'B'
     _logger.log_state(state.name)
 
     try:
@@ -976,8 +1206,6 @@ def final_ball_mission() -> None:
 
             # ----------------------------------------------------------
             if state == _State.SCAN:
-                # Stop-and-look: stop, settle, grab frame, run YOLO + ArUco,
-                # then rotate a small step. Repeat until red is found.
                 _stop()
                 t.sleep(0.1)
 
@@ -988,7 +1216,7 @@ def final_ball_mission() -> None:
 
                 _log_pose_maybe()
 
-                red = world_model.get('R')
+                red  = world_model.get('R')
                 blue = world_model.get('B')
                 red_ready  = red  is not None and red.detection_count  >= _SCAN_MIN_RED_DETECTIONS
                 blue_ready = blue is not None and blue.detection_count >= _SCAN_MIN_BLUE_DETECTIONS
@@ -1002,89 +1230,161 @@ def final_ball_mission() -> None:
                     print(f"% FinalBallMission: scan ready — "
                           f"R=({r.x:.2f},{r.y:.2f})  B={blue_txt}  "
                           f"after {scan_elapsed:.1f} s")
-                    state = _State.NAVIGATE_TO_RED
+
+                    # Pick the closest ball first
+                    rx, ry = _pos()
+                    dist_r = math.hypot(r.x - rx, r.y - ry) if r else float('inf')
+                    dist_b = math.hypot(b.x - rx, b.y - ry) if b else float('inf')
+                    if dist_r <= dist_b:
+                        first_color, second_color = 'R', 'B'
+                    else:
+                        first_color, second_color = 'B', 'R'
+                    print(f"% FinalBallMission: first={first_color} ({min(dist_r,dist_b):.2f}m)  "
+                          f"second={second_color}")
+
+                    state = _State.NAVIGATE_TO_FIRST_BALL
                     _logger.log_state(state.name)
                 else:
-                    service.send("robobot/cmd/ti",
-                                 f"rc 0 {_SCAN_PULSE_VEL:.3f}")
+                    service.send("robobot/cmd/ti", f"rc 0 {_SCAN_PULSE_VEL:.3f}")
                     t.sleep(_SCAN_PULSE_S)
                     _stop()
 
             # ----------------------------------------------------------
-            elif state == _State.NAVIGATE_TO_RED:
-                ok = _navigate_to_ball('R', 'B', world_model)
+            elif state == _State.NAVIGATE_TO_FIRST_BALL:
+                ok = _navigate_to_ball(first_color, second_color, world_model)
                 if ok:
-                    print("% FinalBallMission: reached red ball — Phase 1 done")
-                    state = _State.DONE
+                    state = _State.WAIT_FIRST_PICKUP
                     _logger.log_state(state.name)
                 else:
                     state = _State.FAILED
                     _logger.log_state(state.name)
 
             # ----------------------------------------------------------
-            # ── Phase 2+ states (commented out — re-enable after Phase 1 test) ──
-            #
-            # elif state == _State.WAIT_RED_PICKUP:
-            #     _stop()
-            #     _led(30, 0, 30)
-            #     print("% FinalBallMission: waiting for red ball pickup…")
-            #     # Lower servo for pickup
-            #     service.send("robobot/cmd/T0", "servo 1 500 200")
-            #     # Drive forward 30 cm to capture ball
-            #     # ... (implement servo + drive sequence from CLAUDE.md)
-            #     wait_start = t.monotonic()
-            #     while not service.stop:
-            #         if t.monotonic() - wait_start > _PICKUP_TIMEOUT_S:
-            #             state = _State.FAILED; break
-            #         ok, img = _grab_bgr()
-            #         if ok:
-            #             _detect_color(img, 'R', world_model)
-            #         if world_model.absent_for('R') >= _PICKUP_ABSENT_S:
-            #             world_model.mark_collected('R')
-            #             if _logger: _logger.log_pickup('R', t.monotonic() - mission_start)
-            #             state = _State.DELIVER_RED; break
-            #
-            # elif state == _State.DELIVER_RED:
-            #     _led(0, 16, 30)
-            #     # Navigate to ArUco IDs 10/11 (Quadrant A)
-            #     # Use aruco_to_robot_frame for final 30 cm positioning
-            #     # Raise servo: service.send("robobot/cmd/T0", "servo 1 -800 300")
-            #     # if _logger: _logger.log_deliver('R', 'A')
-            #     state = _State.NAVIGATE_TO_BLUE
-            #
-            # elif state == _State.NAVIGATE_TO_BLUE:
-            #     # Lower servo. Navigate to blue ball with no obstacles.
-            #     ok = _navigate_to_ball('B', None, world_model)
-            #     state = _State.WAIT_BLUE_PICKUP if ok else _State.FAILED
-            #
-            # elif state == _State.WAIT_BLUE_PICKUP:
-            #     _stop()
-            #     _led(30, 0, 30)
-            #     wait_start = t.monotonic()
-            #     while not service.stop:
-            #         if t.monotonic() - wait_start > _PICKUP_TIMEOUT_S:
-            #             state = _State.FAILED; break
-            #         ok, img = _grab_bgr()
-            #         if ok:
-            #             _detect_color(img, 'B', world_model)
-            #         if world_model.absent_for('B') >= _PICKUP_ABSENT_S:
-            #             world_model.mark_collected('B')
-            #             if _logger: _logger.log_pickup('B', t.monotonic() - mission_start)
-            #             state = _State.DELIVER_BLUE; break
-            #
-            # elif state == _State.DELIVER_BLUE:
-            #     _led(0, 16, 30)
-            #     # Navigate to ArUco IDs 14/15 (Quadrant C)
-            #     # Raise servo to release blue ball
-            #     # if _logger: _logger.log_deliver('B', 'C')
-            #     state = _State.RETURN_TO_START
-            #
-            # elif state == _State.RETURN_TO_START:
-            #     _led(0, 16, 30)
-            #     service.send("robobot/cmd/T0", "servo 1 0 0")  # neutral
-            #     ok = _plan_and_drive((x0, y0), [])
-            #     state = _State.DONE if ok else _State.FAILED
+            elif state == _State.WAIT_FIRST_PICKUP:
+                _stop()
+                _led(30, 0, 30)
+                print(f"% FinalBallMission: lowering servo for {first_color} pickup")
+                service.send("robobot/cmd/T0", "servo 1 500 200")
+                t.sleep(0.5)   # let servo reach down position
 
+                wait_start = t.monotonic()
+                while not service.stop:
+                    if t.monotonic() - wait_start > _PICKUP_TIMEOUT_S:
+                        print("% FinalBallMission: pickup timeout")
+                        state = _State.FAILED
+                        _logger.log_state(state.name)
+                        break
+                    ok, img = _grab_bgr()
+                    if ok:
+                        _scan_aruco_passive(img)
+                        _detect_color(img, first_color, world_model)
+                    if world_model.absent_for(first_color) >= _PICKUP_ABSENT_S:
+                        world_model.mark_collected(first_color)
+                        elapsed_s = t.monotonic() - mission_start
+                        if _logger is not None:
+                            _logger.log_pickup(first_color, elapsed_s)
+                        print(f"% FinalBallMission: {first_color} picked up")
+                        state = _State.DELIVER_FIRST
+                        _logger.log_state(state.name)
+                        break
+                    _log_pose_maybe()
+                    t.sleep(0.1)
+
+            # ----------------------------------------------------------
+            elif state == _State.DELIVER_FIRST:
+                _led(0, 16, 30)
+                print(f"% FinalBallMission: delivering {first_color} to "
+                      f"{_DELIVERY_QUADRANT[first_color]}")
+                ok = _navigate_to_delivery(first_color, world_model)
+                if ok:
+                    _stop()
+                    service.send("robobot/cmd/T0", "servo 1 -800 300")  # release ball
+                    t.sleep(1.0)
+                    if _logger is not None:
+                        _logger.log_deliver(first_color, _DELIVERY_QUADRANT[first_color])
+                    print(f"% FinalBallMission: {first_color} delivered to "
+                          f"{_DELIVERY_QUADRANT[first_color]}")
+                    state = _State.NAVIGATE_TO_SECOND_BALL
+                    _logger.log_state(state.name)
+                else:
+                    state = _State.FAILED
+                    _logger.log_state(state.name)
+
+            # ----------------------------------------------------------
+            elif state == _State.NAVIGATE_TO_SECOND_BALL:
+                service.send("robobot/cmd/T0", "servo 1 0 0")   # neutral — no ball held
+                t.sleep(0.3)
+                ok = _navigate_to_second_ball(second_color, world_model)
+                if ok:
+                    state = _State.WAIT_SECOND_PICKUP
+                    _logger.log_state(state.name)
+                else:
+                    # Second ball not found — go home
+                    print("% FinalBallMission: second ball not found, returning to start")
+                    state = _State.RETURN_TO_START
+                    _logger.log_state(state.name)
+
+            # ----------------------------------------------------------
+            elif state == _State.WAIT_SECOND_PICKUP:
+                _stop()
+                _led(30, 0, 30)
+                print(f"% FinalBallMission: lowering servo for {second_color} pickup")
+                service.send("robobot/cmd/T0", "servo 1 500 200")
+                t.sleep(0.5)
+
+                wait_start = t.monotonic()
+                while not service.stop:
+                    if t.monotonic() - wait_start > _PICKUP_TIMEOUT_S:
+                        print("% FinalBallMission: second pickup timeout")
+                        state = _State.FAILED
+                        _logger.log_state(state.name)
+                        break
+                    ok, img = _grab_bgr()
+                    if ok:
+                        _scan_aruco_passive(img)
+                        _detect_color(img, second_color, world_model)
+                    if world_model.absent_for(second_color) >= _PICKUP_ABSENT_S:
+                        world_model.mark_collected(second_color)
+                        elapsed_s = t.monotonic() - mission_start
+                        if _logger is not None:
+                            _logger.log_pickup(second_color, elapsed_s)
+                        print(f"% FinalBallMission: {second_color} picked up")
+                        state = _State.DELIVER_SECOND
+                        _logger.log_state(state.name)
+                        break
+                    _log_pose_maybe()
+                    t.sleep(0.1)
+
+            # ----------------------------------------------------------
+            elif state == _State.DELIVER_SECOND:
+                _led(0, 16, 30)
+                print(f"% FinalBallMission: delivering {second_color} to "
+                      f"{_DELIVERY_QUADRANT[second_color]}")
+                ok = _navigate_to_delivery(second_color, world_model)
+                if ok:
+                    _stop()
+                    service.send("robobot/cmd/T0", "servo 1 -800 300")
+                    t.sleep(1.0)
+                    if _logger is not None:
+                        _logger.log_deliver(second_color, _DELIVERY_QUADRANT[second_color])
+                    print(f"% FinalBallMission: {second_color} delivered to "
+                          f"{_DELIVERY_QUADRANT[second_color]}")
+                    state = _State.RETURN_TO_START
+                    _logger.log_state(state.name)
+                else:
+                    state = _State.FAILED
+                    _logger.log_state(state.name)
+
+            # ----------------------------------------------------------
+            elif state == _State.RETURN_TO_START:
+                _led(0, 16, 30)
+                service.send("robobot/cmd/T0", "servo 1 0 0")
+                t.sleep(0.3)
+                ok = _plan_and_drive((x0, y0), [])
+                state = _State.DONE if ok else _State.FAILED
+                _logger.log_state(state.name)
+
+            # ----------------------------------------------------------
             elif state == _State.DONE:
                 break
 
