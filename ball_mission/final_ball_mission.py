@@ -22,6 +22,7 @@ from json.encoder import INFINITY
 
 import cv2 as cv
 import math
+import numpy as np
 import sys
 import threading
 import time as t
@@ -91,6 +92,15 @@ _ROTATE_ALIGN_TOL_PX = 20    # pixel tolerance for heading-align step [px]
 _ROTATE_STEP_VEL     = 0.40  # rotation speed during heading-align [rad/s]
 _ROTATE_STEP_S       = 0.12  # duration of each rotation pulse [s]
 _ROTATE_MAX_STEPS    = int(math.pi / (_ROTATE_STEP_VEL * _ROTATE_STEP_S)) + 2  # ≈ 180°
+
+# Classical tracking FOV guard
+_IMG_WIDTH              = 820   # camera frame width (pixels)
+_TRACKING_FOV_X_MARGIN  = 100   # classical track invalid when ball centre is within
+                                # this many pixels of the left/right edge; ball can
+                                # only re-enter classical tracking after a YOLO rescan
+
+# Debug image capture
+_IMG_LOG_EVERY_N = 10   # save an annotated frame every N classical-tracker iterations
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (set by final_ball_mission() at start)
@@ -251,6 +261,56 @@ def _ball_in_fov(ball_wx: float, ball_wy: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Debug frame annotation
+# ---------------------------------------------------------------------------
+
+def _annotate_frame(img, ball_data=None, aruco_list=None, label: str = ""):
+    """
+    Return an annotated copy of *img* (BGR) for debug image logging.
+
+    Draws:
+    • Orange vertical lines at the FOV guard margins.
+    • Green bounding box + red centroid dot if *ball_data* is provided.
+    • Cyan polygon + ID text for each marker in *aruco_list*.
+    • White/black label text in the top-left corner.
+    """
+    out = img.copy()
+    h = out.shape[0]
+    # FOV boundary markers (orange)
+    cv.line(out, (_TRACKING_FOV_X_MARGIN, 0),
+            (_TRACKING_FOV_X_MARGIN, h), (0, 165, 255), 1)
+    cv.line(out, (_IMG_WIDTH - _TRACKING_FOV_X_MARGIN, 0),
+            (_IMG_WIDTH - _TRACKING_FOV_X_MARGIN, h), (0, 165, 255), 1)
+    # Ball bounding box
+    if ball_data is not None:
+        x, y, w, bh = ball_data['rect']
+        cX, cY = int(ball_data['center'][0]), int(ball_data['center'][1])
+        cv.rectangle(out, (x, y), (x + w, y + bh), (0, 255, 0), 2)
+        cv.circle(out, (cX, cY), 5, (0, 0, 255), -1)
+        cv.putText(out, f"({cX},{cY})", (x, max(y - 6, 12)),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    # ArUco overlays
+    if aruco_list:
+        for m in aruco_list:
+            corners = m.get('corners')
+            if corners is not None and len(corners) >= 4:
+                pts = np.array(corners, dtype=np.int32).reshape((-1, 1, 2))
+                cv.polylines(out, [pts], True, (0, 255, 255), 2)
+            center = m.get('center')
+            if center:
+                ax_c, ay_c = int(center[0]), int(center[1])
+                cv.putText(out, f"id:{m['id']}", (ax_c + 4, ay_c - 4),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    # State / phase label (white outline + black fill for readability)
+    if label:
+        cv.putText(out, label, (10, 28),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv.putText(out, label, (10, 28),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Background classical tracker (ball)
 # ---------------------------------------------------------------------------
 
@@ -258,19 +318,31 @@ class _ClassicalTracker:
     """
     Background thread running localize_ball_lowest_contour() at ~10 Hz while
     the robot drives. Updates the world model and the mission log continuously.
+
+    FOV guard: if the ball centre pixel is within _TRACKING_FOV_X_MARGIN of the
+    left or right edge, the tracker suspends world-model updates and raises a
+    `_needs_yolo` flag.  The main loop must stop the robot, run a YOLO scan, and
+    call `revalidate()` before classical tracking resumes.  This prevents the
+    tracker from feeding pure noise into the world model when the ball is
+    partially or fully off-screen.
     """
     _INTERVAL_S = 0.10
 
-    def __init__(self, target_color: str, world_model: BallWorldModel):
+    def __init__(self, target_color: str, world_model: BallWorldModel,
+                 frame_label: str = "") -> None:
         self._color = target_color
         self._wm = world_model
+        self._frame_label = frame_label
         self._stop_event = threading.Event()
         self._detected = threading.Event()
+        self._needs_yolo = threading.Event()   # set when ball exits FOV margin
+        self._frame_cnt = 0
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._stop_event.clear()
         self._detected.clear()
+        self._needs_yolo.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -280,13 +352,28 @@ class _ClassicalTracker:
             self._thread.join(timeout=1.0)
 
     def pop_detected(self) -> bool:
+        """Return True (and clear) if a valid in-FOV detection occurred since last call."""
         if self._detected.is_set():
             self._detected.clear()
             return True
         return False
 
+    def is_needs_yolo(self) -> bool:
+        """True when the ball has left the FOV margin and needs YOLO reconfirmation."""
+        return self._needs_yolo.is_set()
+
+    def revalidate(self) -> None:
+        """Call after YOLO confirms the ball position; re-enables classical tracking."""
+        self._needs_yolo.clear()
+        print(f"% FinalBallMission: Tracker [{self._color}]: revalidated by YOLO")
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            # Dormant: wait for YOLO revalidation before resuming classical updates
+            if self._needs_yolo.is_set():
+                t.sleep(self._INTERVAL_S)
+                continue
+
             ok, img = _grab_bgr()
             if not ok:
                 t.sleep(self._INTERVAL_S)
@@ -295,6 +382,21 @@ class _ClassicalTracker:
             found, ball_data = localize_ball_lowest_contour(img, self._color)
             if found:
                 cx, cy = ball_data['center']
+
+                # ── FOV edge guard ────────────────────────────────────────
+                if cx < _TRACKING_FOV_X_MARGIN or cx > (_IMG_WIDTH - _TRACKING_FOV_X_MARGIN):
+                    print(f"% FinalBallMission: Tracker [{self._color}]: "
+                          f"ball at FOV edge cx={cx:.0f} — suspending classical tracking")
+                    if _logger is not None:
+                        ann = _annotate_frame(
+                            img, ball_data,
+                            label=f"FOV_EDGE {self._color} cx={int(cx)}")
+                        _logger.log_frame(ann, label=f"fov_edge_{self._color}")
+                    self._needs_yolo.set()
+                    t.sleep(self._INTERVAL_S)
+                    continue
+
+                # ── Normal in-FOV update ──────────────────────────────────
                 _, _, w, h = ball_data['rect']
                 r_px = min(w, h) / 2.0
                 coords = pixels_to_robot_coords([(cx, cy, r_px)])
@@ -313,6 +415,13 @@ class _ClassicalTracker:
                     print(f"% FinalBallMission: Tracker [{self._color}]: "
                           f"robot=({x_r:.2f},{y_r:.2f})  "
                           f"world=({est.x:.2f},{est.y:.2f})")
+
+                # ── Periodic debug frame save ─────────────────────────────
+                self._frame_cnt += 1
+                if _logger is not None and self._frame_cnt % _IMG_LOG_EVERY_N == 0:
+                    lbl = self._frame_label or f"track_{self._color}"
+                    ann = _annotate_frame(img, ball_data, label=lbl)
+                    _logger.log_frame(ann, label=lbl)
 
             _log_pose_maybe()
             t.sleep(self._INTERVAL_S)
@@ -724,7 +833,10 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
               f"({approach[0]:.2f},{approach[1]:.2f}), "
               f"{len(path)} waypoints, {state.path_length:.2f} m (cycle {cycle})")
 
-        tracker = _ClassicalTracker(target_color, world_model)
+        tracker = _ClassicalTracker(
+            target_color, world_model,
+            frame_label=f"nav_{target_color}_c{cycle}",
+        )
         tracker.start()
         aruco_scanner.start()
 
@@ -774,6 +886,35 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                                 nav_thread.join()
                                 outcome = 'replan'
                                 break
+
+                    # ── FOV-loss: classical tracker needs YOLO reconfirmation ──
+                    if tracker.is_needs_yolo():
+                        print(f"% FinalBallMission: {target_color} left classical FOV — "
+                              f"stopping nav for YOLO reconfirmation")
+                        graph_nav._stop_nav.set()
+                        nav_thread.join()
+                        _stop()
+                        t.sleep(0.1)
+                        ok, img = _grab_bgr()
+                        found_by_yolo = False
+                        if ok:
+                            _scan_aruco_passive(img)
+                            found_by_yolo = _detect_color(img, target_color, world_model)
+                            if _logger is not None:
+                                lbl = (f"YOLO_RECONFIRM_{'FOUND' if found_by_yolo else 'LOST'}"
+                                       f"_{target_color}")
+                                ann = _annotate_frame(img, label=lbl)
+                                _logger.log_frame(ann, label=lbl.lower())
+                        if found_by_yolo:
+                            print(f"% FinalBallMission: {target_color} reconfirmed by YOLO "
+                                  f"— replanning")
+                            tracker.revalidate()
+                            outcome = 'replan'
+                        else:
+                            print(f"% FinalBallMission: {target_color} not found after "
+                                  f"FOV loss — rotation scan")
+                            outcome = 'lost'
+                        break
 
                     # ── Lost-ball fallback ────────────────────────────────
                     if world_model.absent_for(target_color) > _LOST_BALL_TIMEOUT_S:

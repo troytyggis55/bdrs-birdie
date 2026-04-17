@@ -164,6 +164,7 @@ def parse_log(path: str) -> dict:
         arucos     : dict marker_id → list of (elapsed_s, wx, wy, fnx_w, fny_w)
         paths      : list of (elapsed_s, kind, [(x,y),...])
         states     : list of (elapsed_s, state_name)
+        frames     : list of (elapsed_s, filename, label)
         start      : (elapsed_s, x0, y0, hdg0) or None
         duration   : total log duration in seconds
     """
@@ -173,6 +174,7 @@ def parse_log(path: str) -> dict:
     arucos: dict = defaultdict(list)
     paths: list = []
     states: list = []
+    frames: list = []
     start_record = None
 
     with open(path, encoding="utf-8") as f:
@@ -220,6 +222,11 @@ def parse_log(path: str) -> dict:
                 fny_w = fnx * math.sin(hdg) + fny * math.cos(hdg)
                 arucos[marker_id].append((ts, wx, wy, fnx_w, fny_w))
 
+            elif ev == "BM_FRAME" and fields:
+                fname = fields[0]
+                label = fields[1] if len(fields) > 1 else ""
+                frames.append((ts, fname, label))
+
             elif ev in ("BM_PATH", "BM_REPLAN") and fields:
                 if ev == "BM_PATH":
                     n = int(fields[0])
@@ -244,6 +251,7 @@ def parse_log(path: str) -> dict:
         arucos=dict(arucos),
         paths=paths,
         states=states,
+        frames=frames,
         start=start_record,
         duration=duration,
     )
@@ -277,6 +285,8 @@ class BallMissionReplay:
         self._playing = False
         self._speed_idx = 2      # index into _PLAY_SPEED_PRESETS (1.0×)
         self._last_wall = 0.0    # wall time of last auto-advance tick
+        # Frames dir: sibling to log file, named <stem>_frames/
+        self._frames_dir = Path(log_path).parent / (Path(log_path).stem + "_frames")
 
         self._build_figure()
         self._update()
@@ -286,20 +296,21 @@ class BallMissionReplay:
     # ------------------------------------------------------------------
 
     def _build_figure(self) -> None:
-        fig = plt.figure(figsize=(16, 9))
+        fig = plt.figure(figsize=(19, 9))
         fig.patch.set_facecolor(C_BG)
         gs = GridSpec(
             2, 3,
             figure=fig,
-            left=0.05, right=0.97,
+            left=0.04, right=0.97,
             top=0.95, bottom=0.10,
-            wspace=0.25, hspace=0.08,
+            wspace=0.20, hspace=0.08,
             height_ratios=[8, 1],
-            width_ratios=[5, 2, 0.01],
+            width_ratios=[5, 4, 3],
         )
         self._fig = fig
         self._ax_map  = fig.add_subplot(gs[0, 0])   # main top-down map
-        self._ax_info = fig.add_subplot(gs[0, 1])   # text info panel
+        self._ax_cam  = fig.add_subplot(gs[0, 1])   # camera frame viewer
+        self._ax_info = fig.add_subplot(gs[0, 2])   # text info panel
 
         # Slider row
         ax_slider = fig.add_axes([0.10, 0.04, 0.62, 0.025])
@@ -444,6 +455,7 @@ class BallMissionReplay:
 
     def _update(self) -> None:
         self._draw_map()
+        self._draw_cam()
         self._draw_info()
         self._fig.canvas.draw_idle()
 
@@ -592,6 +604,46 @@ class BallMissionReplay:
             ax.legend(handles, labels, fontsize=8, loc='lower right',
                       framealpha=0.85)
 
+    def _draw_cam(self) -> None:
+        ax = self._ax_cam
+        ax.cla()
+        ax.set_facecolor('#1a1a1a')
+        ax.axis('off')
+
+        frames = self._d.get('frames', [])
+        # Find latest frame at or before current replay time
+        active = [(ts, fn, lbl) for ts, fn, lbl in frames if ts <= self._t]
+
+        if not active:
+            ax.text(0.5, 0.5,
+                    'No frames yet' if frames else 'No frames logged',
+                    transform=ax.transAxes, ha='center', va='center',
+                    color='#888888', fontsize=10, fontfamily='monospace')
+            ax.set_title('Camera', fontsize=9)
+            return
+
+        ts, fname, label = active[-1]
+        fpath = self._frames_dir / fname
+        if not fpath.exists():
+            ax.text(0.5, 0.5, f'Missing:\n{fname}',
+                    transform=ax.transAxes, ha='center', va='center',
+                    color='#cc4444', fontsize=8, fontfamily='monospace')
+            ax.set_title('Camera', fontsize=9)
+            return
+
+        try:
+            img = plt.imread(str(fpath))   # returns RGB float or uint8
+            ax.imshow(img, aspect='auto')
+        except Exception as exc:
+            ax.text(0.5, 0.5, f'Load error:\n{exc}',
+                    transform=ax.transAxes, ha='center', va='center',
+                    color='#cc4444', fontsize=8)
+
+        # Title: timestamp + label (replace underscores so it reads naturally)
+        pretty_label = label.replace('_', ' ')
+        ax.set_title(f'Camera  t={ts:.2f}s  [{pretty_label}]',
+                     fontsize=8, fontfamily='monospace')
+
     def _draw_info(self) -> None:
         ax = self._ax_info
         ax.cla()
@@ -675,8 +727,9 @@ def main() -> None:
     n_balls  = sum(len(v) for v in data['balls'].values())
     n_aruco  = sum(len(v) for v in data['arucos'].values())
     n_paths  = len(data['paths'])
+    n_frames = len(data.get('frames', []))
     print(f"  poses={n_poses}  ball_dets={n_balls}  aruco_dets={n_aruco}  "
-          f"paths={n_paths}  duration={data['duration']:.1f}s")
+          f"paths={n_paths}  frames={n_frames}  duration={data['duration']:.1f}s")
 
     if not data['events']:
         print("Log is empty — nothing to replay.")

@@ -21,6 +21,7 @@ BM_REPLAN       reason eff_sx eff_sy n x1 y1 ...
 BM_PICKUP       color elapsed_s
 BM_DELIVER      color quadrant
 BM_DONE         1|0 elapsed_s
+BM_FRAME        filename label
 """
 
 from __future__ import annotations
@@ -46,8 +47,13 @@ class FinalBallLogger:
         self._path = Path(log_dir) / f"ball_mission_{ts}.log"
         self._f = open(self._path, "w", encoding="utf-8")
         self._t0 = time.monotonic()
+        # Frames directory: sibling to the log file, named <logname>_frames/
+        self._frames_dir = self._path.parent / (self._path.stem + "_frames")
+        self._frames_dir.mkdir(parents=True, exist_ok=True)
+        self._frame_counter = 0
         self._write_header()
         print(f"% FinalBallLogger: logging to {self._path}")
+        print(f"% FinalBallLogger: frames  → {self._frames_dir}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -70,6 +76,7 @@ class FinalBallLogger:
             "# BM_PICKUP       color elapsed_s",
             "# BM_DELIVER      color quadrant",
             "# BM_DONE         1|0 elapsed_s",
+            "# BM_FRAME        filename label",
             "#",
         ]
         for line in lines:
@@ -195,6 +202,27 @@ class FinalBallLogger:
     def log_done(self, success: bool, elapsed_s: float) -> None:
         """Log mission completion."""
         self._emit("BM_DONE", 1 if success else 0, elapsed_s)
+
+    def log_frame(self, img_bgr, label: str = "") -> None:
+        """
+        Save *img_bgr* as a JPEG to the frames directory and emit a BM_FRAME
+        log entry.  Safe to call from background threads.
+
+        Parameters
+        ----------
+        img_bgr : numpy ndarray (H×W×3, BGR)  — annotated camera frame
+        label   : short description tag (e.g. 'track_R', 'fov_edge_R', ...)
+        """
+        try:
+            import cv2 as cv
+            self._frame_counter += 1
+            fname = f"frame_{self._frame_counter:05d}.jpg"
+            fpath = self._frames_dir / fname
+            cv.imwrite(str(fpath), img_bgr)
+            label_tok = (label or "nostate").replace(" ", "_")
+            self._emit("BM_FRAME", fname, label_tok)
+        except Exception as exc:
+            print(f"% FinalBallLogger: log_frame failed: {exc}")
 
     # ------------------------------------------------------------------
 
