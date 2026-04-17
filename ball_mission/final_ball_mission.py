@@ -40,6 +40,7 @@ from CamVision.ballcoords import pixels_to_robot_coords, C_X as _CAM_CX
 from aruco.detect_aruco import detect_aruco
 from CamVision.coord_conversion import aruco_to_robot_frame
 from ball_mission.final_ball_logger import FinalBallLogger
+from ball_mission.arena_walls import ArenaWallModel, walls_from_aruco_world
 from scam import cam
 from spose import pose
 from uservice import service
@@ -84,13 +85,21 @@ _POSE_LOG_INTERVAL_S = 0.20  # minimum gap between BM_POSE log entries [s]
 
 _ARUCO_DICT = "DICT_4X4_100"  # dictionary used to print arena markers (IDs 10–17)
 _ARUCO_MARKER_SIZE_M = 0.10   # physical side length [m] — matches CLAUDE.md
+_ARUCO_ID_MIN = 10            # ignore markers outside this range (reduces noise)
+_ARUCO_ID_MAX = 17
+
+_ROTATE_ALIGN_TOL_PX = 20    # pixel tolerance for heading-align step [px]
+_ROTATE_STEP_VEL     = 0.40  # rotation speed during heading-align [rad/s]
+_ROTATE_STEP_S       = 0.12  # duration of each rotation pulse [s]
+_ROTATE_MAX_STEPS    = int(math.pi / (_ROTATE_STEP_VEL * _ROTATE_STEP_S)) + 2  # ≈ 180°
 
 # ---------------------------------------------------------------------------
-# Module-level logger (set by final_ball_mission() at start)
+# Module-level singletons (set by final_ball_mission() at start)
 # ---------------------------------------------------------------------------
 
 _logger: FinalBallLogger | None = None
 _last_pose_log: float = 0.0  # monotonic time of last BM_POSE write
+_wall_model: ArenaWallModel | None = None  # grows as ArUco markers are seen
 
 
 def _log_pose_maybe() -> None:
@@ -126,6 +135,91 @@ def _approach_point(ball_x: float, ball_y: float,
     if dist < 1e-3:
         return ball_x, ball_y
     return ball_x - standoff * dx / dist, ball_y - standoff * dy / dist
+
+
+def _approach_point_wall_aware(
+    ball_x: float, ball_y: float,
+    robot_x: float, robot_y: float,
+    standoff: float = _STANDOFF_M,
+) -> tuple[float, float]:
+    """
+    Compute the pathfinding approach point for a ball.
+
+    When wall mapping is available the approach is placed on the FAR side of
+    the ball from the plus-center, so the ball is always between the robot and
+    the arena walls.  This prevents the planner from targeting a point that is
+    squeezed between the ball and a wall.
+
+    Fallback: standard robot-relative approach when no wall data exists.
+    """
+    if _wall_model is not None:
+        plus_center = _wall_model.get_plus_center()
+        if plus_center is not None:
+            cx, cy = plus_center
+            dx = ball_x - cx
+            dy = ball_y - cy
+            dist = math.hypot(dx, dy)
+            if dist > 0.02:
+                nx, ny = dx / dist, dy / dist   # outward unit vector (away from plus)
+                ap = (ball_x + standoff * nx, ball_y + standoff * ny)
+                print(f"% FinalBallMission: wall-aware approach "
+                      f"goal=({ap[0]:.2f},{ap[1]:.2f})  "
+                      f"plus=({cx:.2f},{cy:.2f})")
+                return ap
+    # Fallback
+    return _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
+
+
+def _rotate_to_face_ball(target_color: str) -> bool:
+    """
+    Stop and rotate until *target_color* is centred in the camera frame
+    (within _ROTATE_ALIGN_TOL_PX pixels of horizontal centre).
+
+    Uses classical detection (localize_ball_lowest_contour) since we are
+    close to the ball; falls back to YOLO if classical fails.  Rotates up
+    to ~180° searching before giving up.
+
+    Called after pathfinding navigation completes, before fine approach.
+    """
+    _stop()
+    t.sleep(0.1)
+    print(f"% FinalBallMission: rotate-to-face {target_color}")
+
+    for step in range(_ROTATE_MAX_STEPS):
+        if service.stop:
+            return False
+
+        ok, img = _grab_bgr()
+        if not ok:
+            t.sleep(0.05)
+            continue
+
+        found, ball_data = localize_ball_lowest_contour(img, target_color)
+        if not found:
+            found, ball_data = localize_ball_yolo(img, target_color)
+
+        if found:
+            cx, _ = ball_data['center']
+            error_x = _CAM_CX - cx   # positive = ball to the left → turn CCW (+)
+            if abs(error_x) < _ROTATE_ALIGN_TOL_PX:
+                _stop()
+                print(f"% FinalBallMission: aligned to {target_color}  "
+                      f"err_x={int(error_x)} px  steps={step}")
+                return True
+            turn_sign = 1.0 if error_x > 0 else -1.0
+        else:
+            turn_sign = 1.0   # sweep if ball not visible
+
+        service.send("robobot/cmd/ti",
+                     f"rc 0 {turn_sign * _ROTATE_STEP_VEL:.3f}")
+        t.sleep(_ROTATE_STEP_S)
+        _stop()
+        t.sleep(0.05)
+
+    _stop()
+    print(f"% FinalBallMission: rotate-to-face {target_color} gave up after "
+          f"{_ROTATE_MAX_STEPS} steps")
+    return False
 
 
 def _stop() -> None:
@@ -276,17 +370,28 @@ class _PassiveArucoScanner:
             rx, ry, hdg = pose.pose[0], pose.pose[1], pose.pose[2]
             parsed: list[dict] = []
             for m in markers:
+                if not _is_arena_aruco(m['id']):
+                    continue   # ignore IDs outside 10–17
                 result = aruco_to_robot_frame(m, marker_size_m=_ARUCO_MARKER_SIZE_M)
                 if result is None:
                     continue
                 x_r, y_r, fnx, fny = result
+                # Convert to world frame for wall model
+                fnx_w = fnx * math.cos(hdg) - fny * math.sin(hdg)
+                fny_w = fnx * math.sin(hdg) + fny * math.cos(hdg)
+                wx = rx + x_r * math.cos(hdg) - y_r * math.sin(hdg)
+                wy = ry + x_r * math.sin(hdg) + y_r * math.cos(hdg)
                 if _logger is not None:
                     _logger.log_aruco(m['id'], x_r, y_r, fnx, fny, rx, ry, hdg)
+                if _wall_model is not None:
+                    _wall_model.update(m['id'], wx, wy, fnx_w, fny_w)
                 parsed.append({'id': m['id'], 'x_r': x_r, 'y_r': y_r,
-                                'fnx': fnx, 'fny': fny})
+                                'fnx': fnx, 'fny': fny,
+                                'wx': wx, 'wy': wy})
                 print(f"% FinalBallMission: ArUco id={m['id']}  "
                       f"robot_frame=({x_r:.2f},{y_r:.2f})  "
-                      f"normal=({fnx:.2f},{fny:.2f})")
+                      f"normal=({fnx:.2f},{fny:.2f})  "
+                      f"walls_known={_wall_model.marker_count() if _wall_model else 0}")
 
             with self._lock:
                 self._latest = parsed
@@ -352,10 +457,15 @@ def _detect_color(img, color: str, world_model: BallWorldModel) -> bool:
     return True
 
 
+def _is_arena_aruco(marker_id: int) -> bool:
+    """Return True only for the 8 inner-wall markers (IDs 10–17) we care about."""
+    return _ARUCO_ID_MIN <= marker_id <= _ARUCO_ID_MAX
+
+
 def _scan_aruco_passive(img) -> None:
     """
-    Run detect_aruco() on *img* and log every visible marker.
-    Call inline whenever we have a fresh stopped-robot frame during SCAN.
+    Run detect_aruco() on *img*, log every visible arena marker (IDs 10–17),
+    and update the wall model. Call inline on fresh stopped-robot frames.
     """
     try:
         markers, _ = detect_aruco(img, dictionary_name=_ARUCO_DICT)
@@ -363,14 +473,24 @@ def _scan_aruco_passive(img) -> None:
         return
     rx, ry, hdg = pose.pose[0], pose.pose[1], pose.pose[2]
     for m in markers:
+        if not _is_arena_aruco(m['id']):
+            continue   # ignore test markers, camera calibration targets, etc.
         result = aruco_to_robot_frame(m, marker_size_m=_ARUCO_MARKER_SIZE_M)
         if result is None:
             continue
         x_r, y_r, fnx, fny = result
+        # Convert face normal to world frame for wall model
+        fnx_w = fnx * math.cos(hdg) - fny * math.sin(hdg)
+        fny_w = fnx * math.sin(hdg) + fny * math.cos(hdg)
+        wx = rx + x_r * math.cos(hdg) - y_r * math.sin(hdg)
+        wy = ry + x_r * math.sin(hdg) + y_r * math.cos(hdg)
         if _logger is not None:
             _logger.log_aruco(m['id'], x_r, y_r, fnx, fny, rx, ry, hdg)
+        if _wall_model is not None:
+            _wall_model.update(m['id'], wx, wy, fnx_w, fny_w)
         print(f"% FinalBallMission: [SCAN] ArUco id={m['id']}  "
-              f"robot_frame=({x_r:.2f},{y_r:.2f})")
+              f"robot_frame=({x_r:.2f},{y_r:.2f})  "
+              f"walls_known={_wall_model.marker_count() if _wall_model else 0}")
 
 
 # ---------------------------------------------------------------------------
@@ -523,13 +643,17 @@ def _drive_path(path: list[tuple[float, float]]) -> bool:
 
 
 def _plan_and_drive(goal: tuple[float, float],
-                    obstacles: list[CircleObstacle]) -> bool:
+                    obstacles: list) -> bool:
     """
     Plan a path from current position to *goal*, execute it, log path + result.
+    Walls from the ArenaWallModel are automatically appended to *obstacles*.
     """
-    eff_start = find_safe_start(_pos(), goal, obstacles, _CFG)
+    all_obs = list(obstacles)
+    if _wall_model is not None:
+        all_obs.extend(_wall_model.get_walls())
+    eff_start = find_safe_start(_pos(), goal, all_obs, _CFG)
     planner = RealtimePathfinder(goal=goal, cfg=_CFG, replan_cooldown=0.0)
-    state = planner.update(eff_start, obstacles)
+    state = planner.update(eff_start, all_obs)
 
     if not state.solved:
         print("% FinalBallMission: planning failed")
@@ -562,16 +686,24 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
 
         rx, ry = _pos()
         if math.hypot(ball.x - rx, ball.y - ry) <= _CLOSE_RANGE_M:
+            _rotate_to_face_ball(target_color)
             return _fine_approach(target_color, world_model)
 
-        approach = _approach_point(ball.x, ball.y, rx, ry)
+        approach = _approach_point_wall_aware(ball.x, ball.y, rx, ry)
         plan_bx, plan_by = ball.x, ball.y
 
-        obstacles: list[CircleObstacle] = []
+        # Build obstacle list: other ball + all known arena walls
+        obstacles: list = []
         if obstacle_color:
             obs_est = world_model.get(obstacle_color)
             if obs_est and not obs_est.collected:
-                obstacles = [CircleObstacle(obs_est.x, obs_est.y, _OBS_BALL_RADIUS)]
+                obstacles.append(CircleObstacle(obs_est.x, obs_est.y, _OBS_BALL_RADIUS))
+        if _wall_model is not None:
+            obstacles.extend(_wall_model.get_walls())
+            if _wall_model.marker_count() > 0:
+                print(f"% FinalBallMission: planning with "
+                      f"{len(_wall_model.get_walls())} wall segments "
+                      f"from {_wall_model.marker_count()} marker(s)")
 
         eff_start = find_safe_start(_pos(), approach, obstacles, _CFG)
         planner = RealtimePathfinder(goal=approach, cfg=_CFG, replan_cooldown=0.0)
@@ -664,6 +796,7 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
             return False
 
         if outcome in ('close', 'done'):
+            _rotate_to_face_ball(target_color)
             return _fine_approach(target_color, world_model)
 
         if outcome == 'replan':
@@ -705,7 +838,7 @@ def final_ball_mission() -> None:
     Run the final ball mission.
     Called from mqtt-client.py.
     """
-    global _logger, _last_pose_log
+    global _logger, _last_pose_log, _wall_model
 
     print("% FinalBallMission: starting")
     _led(0, 16, 30)
@@ -719,6 +852,7 @@ def final_ball_mission() -> None:
     h0 = _heading()
 
     _logger = FinalBallLogger()
+    _wall_model = ArenaWallModel()
     _last_pose_log = 0.0
     _logger.log_start(x0, y0, h0)
 

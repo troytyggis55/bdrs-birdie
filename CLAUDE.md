@@ -65,8 +65,9 @@ Two-wheeled robot that uses hybrid YOLO + classical vision to detect colored bal
         +--------+--------+
 ```
 
-Each quadrant is **25 cm × 25 cm**. Quadrants share inner walls; each inner wall carries **two ArUco markers** (one per quadrant face), size **10 cm**, placed so their face normals cross the centre of their respective quadrant.
-
+The entire square is 60cm x 60cm.
+Each quadrant is **30 cm × 30 cm**. Quadrants share inner walls; each inner wall carries **two ArUco markers** (one per quadrant face), size **10 cm**, placed so their face normals cross around the centre of their respective quadrant.
+The center of each ArUco marker is 17cm from the inner corner of the quadrant, meaning they are 13 cm from the outer corner that the robot approaches from.
 **ArUco IDs on inner walls (counter-clockwise ordering):**
 
 | Quadrant | Left wall ID | Right wall ID |
@@ -77,6 +78,40 @@ Each quadrant is **25 cm × 25 cm**. Quadrants share inner walls; each inner wal
 | D        | 16          | 17            |
 
 *Left/Right defined as seen from outside corner of the quadrant, looking toward the centre of the the entire square.*
+
+### Mapping the square walls based on ArUco
+We can reconstruct the inner “plus” walls from a single marker pose. For ID 10 (left wall of A), let `(nx, ny)` 
+be the marker face normal and let the along-wall direction be `(tx, ty) = (-ny, nx)`. 
+Draw the 60cm wall along `(tx, ty)` from `P − 0.13·t` to `P + 0.47·t` (P = marker center). 
+Then draw the perpendicular inner wall along `(nx, ny)`, centered at `P + 0.17·t`, spanning `±0.30m` (i.e. from `C − 0.30·n` to `C + 0.30·n`).
+This is mirrored for the right wall walls, but the pattern is the same for all quadrants. This way, any ArUco sighting gives us the full arena geometry and our position within it.
+
+To achieve best accuracy, this mapping should be done continously with the latest ArUco sighting based of the closest marker to the robot.
+
+**Plus-center:** The intersection of the two inner walls (center of the 60×60 arena) can be computed from any marker as `P + 0.17·t` (using the marker-appropriate t direction).  `ArenaWallModel.get_plus_center()` averages this across all qualified markers.
+
+### Ball Approach Strategy
+
+Three rules that reduce pathfinding failures near walls:
+
+**1. ArUco ID filter**
+Only markers with IDs 10–17 (the 8 inner-wall markers) are logged and used for wall mapping.  All others (test targets, calibration boards, etc.) are silently ignored.  Implemented as `_is_arena_aruco()` in `final_ball_mission.py`.
+
+**2. Wall-aware pathfinding goal**
+When `ArenaWallModel` has at least one qualified marker (≥ 2 detections):
+- Compute the plus-center from the wall model.
+- Place the pathfinding approach point on the **far side of the ball from the plus-center**: `approach = ball + standoff · normalize(ball − plus_center)`.
+- This ensures the ball is always between the robot and the inner walls, so the planner targets open space outside the arena rather than the tight gap between ball and wall.
+
+If no wall data exists, falls back to the standard robot-relative approach (`_approach_point`).  Implemented in `_approach_point_wall_aware()`.
+
+**3. Rotate-to-face before fine approach**
+After pathfinding navigation reaches the approach point (or triggers the close-range hand-off), the robot:
+1. Stops.
+2. Rotates in small pulses until the ball is centred within `_ROTATE_ALIGN_TOL_PX = 20 px` (uses classical HSV detection first, YOLO fallback).  Searches up to ~180°.
+3. Hands off to `_fine_approach()` (classical P-control to 30 cm).
+
+Implemented in `_rotate_to_face_ball()`, called from every exit path out of the navigation loop in `_navigate_to_ball()`.
 
 **Delivery targets:**
 - Red ball → **Quadrant A** (IDs 10, 11)

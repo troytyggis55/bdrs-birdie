@@ -24,6 +24,7 @@ Panels
     • colored cloud         — all ball world-model estimates (BM_BALL_DET)
     • large colored circle  — latest ball world-model position per color
     • cyan diamonds         — ArUco marker world-frame centroids (BM_ARUCO)
+    • dark teal thick lines — inferred arena wall segments (from BM_ARUCO)
     • orange dashed line    — most recent planned path (BM_PATH / BM_REPLAN)
     • green replanned line  — most recent replan path
 
@@ -58,6 +59,8 @@ C_ROBOT     = "#111111"
 C_RED_BALL  = "#e03030"
 C_BLUE_BALL = "#2060d0"
 C_ARUCO     = "#00aaaa"
+C_WALL      = "#006060"   # dark teal — inferred arena wall segments
+C_WALL_PERP = "#008888"   # slightly lighter for the perpendicular wall
 C_PATH      = "#e07800"
 C_REPLAN    = "#228822"
 C_START     = "#1e8840"
@@ -76,6 +79,67 @@ ARENA_QUADRANTS = {
     'D': (16, 17),
 }
 ARUCO_QUADRANT = {mid: q for q, ids in ARENA_QUADRANTS.items() for mid in ids}
+
+
+# ---------------------------------------------------------------------------
+# Wall geometry (mirrors arena_walls.py — inlined to keep replay standalone)
+# ---------------------------------------------------------------------------
+
+def _walls_from_aruco_world(
+    marker_id: int, wx: float, wy: float, fnx_w: float, fny_w: float
+) -> list[tuple]:
+    """
+    Return [(x1,y1,x2,y2), (x1,y1,x2,y2)] for the two wall segments
+    inferred from a single ArUco world-frame detection.
+    Segment 0 = wall the marker sits on; Segment 1 = perpendicular inner wall.
+    """
+    # Right-wall markers (odd IDs): mirror the along-wall direction
+    if marker_id % 2 == 1:
+        tx, ty = fny_w, -fnx_w   # 90° CW
+    else:
+        tx, ty = -fny_w, fnx_w   # 90° CCW
+
+    # Wall the marker is on (60 cm: 13 cm before → 47 cm after)
+    seg0 = (wx - 0.13 * tx, wy - 0.13 * ty,
+            wx + 0.47 * tx, wy + 0.47 * ty)
+
+    # Perpendicular inner wall (centred 17 cm along t, spans ±30 cm along n)
+    cx = wx + 0.17 * tx
+    cy = wy + 0.17 * ty
+    seg1 = (cx - 0.30 * fnx_w, cy - 0.30 * fny_w,
+            cx + 0.30 * fnx_w, cy + 0.30 * fny_w)
+
+    return [seg0, seg1]
+
+
+def _ema_aruco_up_to(
+    aruco_data: dict[int, list], t_current: float, alpha: float = 0.35
+) -> dict[int, tuple]:
+    """
+    Replay the EMA smoothing for each marker up to *t_current*.
+    Returns marker_id → (wx, wy, fnx_w, fny_w) best estimate.
+    """
+    estimates: dict[int, dict] = {}
+    for mid, entries in aruco_data.items():
+        for ts, wx, wy, fnxw, fnyw in entries:
+            if ts > t_current:
+                break
+            if mid not in estimates:
+                estimates[mid] = {'wx': wx, 'wy': wy, 'fnx': fnxw, 'fny': fnyw, 'n': 1}
+            else:
+                e = estimates[mid]
+                e['wx']  = (1 - alpha) * e['wx']  + alpha * wx
+                e['wy']  = (1 - alpha) * e['wy']  + alpha * wy
+                e['fnx'] = (1 - alpha) * e['fnx'] + alpha * fnxw
+                e['fny'] = (1 - alpha) * e['fny'] + alpha * fnyw
+                mag = math.hypot(e['fnx'], e['fny'])
+                if mag > 1e-3:
+                    e['fnx'] /= mag
+                    e['fny'] /= mag
+                e['n'] += 1
+    # Only return markers seen ≥2 times (matches ArenaWallModel.min_detections)
+    return {mid: (e['wx'], e['wy'], e['fnx'], e['fny'])
+            for mid, e in estimates.items() if e['n'] >= 2}
 
 
 # ---------------------------------------------------------------------------
@@ -454,20 +518,35 @@ class BallMissionReplay:
                         fontsize=9, color=style['color'], fontweight='bold')
             all_x.extend(wxs); all_y.extend(wys)
 
-        # ── ArUco marker world positions ─────────────────────────────
+        # ── Arena walls inferred from EMA ArUco estimates ─────────────
+        wall_estimates = _ema_aruco_up_to(self._d['arucos'], self._t)
+        wall_drawn_ids: set = set()
+        for mid, (wx, wy, fnxw, fnyw) in wall_estimates.items():
+            segs = _walls_from_aruco_world(mid, wx, wy, fnxw, fnyw)
+            for i, (x1, y1, x2, y2) in enumerate(segs):
+                color = C_WALL if i == 0 else C_WALL_PERP
+                lbl = 'Arena walls' if (not wall_drawn_ids and i == 0) else None
+                ax.plot([x1, x2], [y1, y2], '-',
+                        color=color, linewidth=3.5, zorder=3,
+                        alpha=0.75, solid_capstyle='round',
+                        label=lbl)
+                wall_drawn_ids.add(mid)
+            all_x += [wx]; all_y += [wy]
+
+        # ── ArUco marker world positions (on top of walls) ────────────
         arucos = self._arucos_up_to()
         for mid, (ts, wx, wy, fnxw, fnyw) in arucos.items():
             quadrant = ARUCO_QUADRANT.get(mid, '?')
-            ax.plot(wx, wy, 'D', color=C_ARUCO, markersize=10, zorder=6,
+            ax.plot(wx, wy, 'D', color=C_ARUCO, markersize=10, zorder=7,
                     markeredgecolor='black', markeredgewidth=0.7)
             ax.annotate(f"  id:{mid}({quadrant})", (wx, wy),
                         fontsize=8, color=C_ARUCO)
-            # Face normal arrow (30 cm)
+            # Face normal arrow (20 cm)
             ax.annotate(
-                '', xy=(wx + 0.30 * fnxw, wy + 0.30 * fnyw),
+                '', xy=(wx + 0.20 * fnxw, wy + 0.20 * fnyw),
                 xytext=(wx, wy),
                 arrowprops=dict(arrowstyle='->', color=C_ARUCO, lw=1.5),
-                zorder=5,
+                zorder=6,
             )
             all_x.append(wx); all_y.append(wy)
 
@@ -532,15 +611,19 @@ class BallMissionReplay:
                 lines.append(f"{name}: not seen")
 
         arucos = self._arucos_up_to()
+        wall_ests = _ema_aruco_up_to(self._d['arucos'], self._t)
+        n_walls = len(wall_ests) * 2  # 2 segments per marker
         if arucos:
             ids = sorted(arucos.keys())
-            lines.append(f"ArUco seen: {ids}")
+            lines.append(f"ArUco seen: {ids}  ({n_walls} wall segs)")
             for mid in ids:
                 ts, wx, wy, _, _ = arucos[mid]
                 q = ARUCO_QUADRANT.get(mid, '?')
-                lines.append(f"  id:{mid}({q})  ({wx:.2f},{wy:.2f})")
+                ema_marker = wall_ests.get(mid)
+                ema_tag = " [in wall model]" if ema_marker else " [pending]"
+                lines.append(f"  id:{mid}({q})  ({wx:.2f},{wy:.2f}){ema_tag}")
         else:
-            lines.append("ArUco: none seen")
+            lines.append("ArUco: none seen  (0 wall segs)")
 
         lines.append("")
         lines.append(f"t = {self._t:.2f} / {self._duration:.2f} s")
