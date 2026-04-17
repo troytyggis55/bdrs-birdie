@@ -42,7 +42,7 @@ from CamVision.ballcoords import pixels_to_robot_coords, C_X as _CAM_CX
 from aruco.detect_aruco import detect_aruco
 from CamVision.coord_conversion import aruco_to_robot_frame
 from ball_mission.final_ball_logger import FinalBallLogger
-from ball_mission.arena_walls import ArenaWallModel, walls_from_aruco_world
+from ball_mission.arena_walls import ArenaWallModel
 from scam import cam
 from spose import pose
 from uservice import service
@@ -62,7 +62,7 @@ _CFG = PlannerConfig(
 )
 
 _NAV_STANDOFF_M   = 0.30   # pathfinding approach point: this far behind the ball [m]
-_FINE_STANDOFF_M  = 0.20   # fine-approach stop distance [m]
+_FINE_STANDOFF_M  = 0.25   # fine-approach stop distance [m]
 _OBS_BALL_RADIUS  = 0.08   # obstacle radius for other balls in pathfinder [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
 _PICKUP_TIMEOUT_S = 30.0   # max wait for pickup before aborting [s]
@@ -746,6 +746,10 @@ def _plan_and_drive(goal: tuple[float, float],
     all_obs = list(obstacles)
     if _wall_model is not None:
         all_obs.extend(_wall_model.get_walls())
+        perim_walls, bucket = _wall_model.get_perimeter_obstacles()
+        all_obs.extend(perim_walls)
+        if bucket is not None:
+            all_obs.append(bucket)
     eff_start = find_safe_start(_pos(), goal, all_obs, _CFG)
     planner = RealtimePathfinder(goal=goal, cfg=_CFG, replan_cooldown=0.0)
     state = planner.update(eff_start, all_obs)
@@ -792,10 +796,16 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
             if obs_est and not obs_est.collected:
                 obstacles.append(CircleObstacle(obs_est.x, obs_est.y, _OBS_BALL_RADIUS))
         if _wall_model is not None:
-            obstacles.extend(_wall_model.get_walls())
+            inner_walls = _wall_model.get_walls()
+            perim_walls, bucket = _wall_model.get_perimeter_obstacles()
+            obstacles.extend(inner_walls)
+            obstacles.extend(perim_walls)
+            if bucket is not None:
+                obstacles.append(bucket)
             if _wall_model.marker_count() > 0:
                 print(f"% FinalBallMission: planning with "
-                      f"{len(_wall_model.get_walls())} wall segments "
+                      f"{len(inner_walls)} inner + {len(perim_walls)} perim wall segments, "
+                      f"bucket={'yes' if bucket else 'no'}, "
                       f"from {_wall_model.marker_count()} marker(s)")
 
         eff_start = find_safe_start(_pos(), approach, obstacles, _CFG)

@@ -61,6 +61,19 @@ C_BLUE_BALL = "#2060d0"
 C_ARUCO     = "#00aaaa"
 C_WALL      = "#006060"   # dark teal — inferred arena wall segments
 C_WALL_PERP = "#008888"   # slightly lighter for the perpendicular wall
+C_PERIM     = "#8844aa"   # purple — perimeter walls
+C_BUCKET    = "#cc6600"   # orange — bucket obstacle
+
+# ---------------------------------------------------------------------------
+# Perimeter obstacle config — must match arena_walls.py
+# Coords relative to plus-center: +X=toward D, +Y=toward A, -Y=toward C
+# ---------------------------------------------------------------------------
+_C_WALL_P1     = (-0.65, -1.55)
+_C_WALL_P2     = ( 1.10, -1.55)
+_D_WALL_P1     = ( 1.04, -1.50)
+_D_WALL_P2     = ( 1.04,  1.50)
+_BUCKET_XY     = (-1.02, -0.64)
+_BUCKET_RADIUS = 0.15
 C_PATH      = "#e07800"
 C_REPLAN    = "#228822"
 C_START     = "#1e8840"
@@ -110,6 +123,70 @@ def _walls_from_aruco_world(
             cx + 0.30 * fnx_w, cy + 0.30 * fny_w)
 
     return [seg0, seg1]
+
+
+def _ec_from_marker_replay(
+    marker_id: int, fnx: float, fny: float
+) -> tuple[float, float]:
+    """Mirror of arena_walls._ec_from_marker — kept standalone for replay."""
+    if 10 <= marker_id <= 11:
+        return -fnx, -fny
+    elif 12 <= marker_id <= 13:
+        return -fny, fnx
+    elif 14 <= marker_id <= 15:
+        return fnx, fny
+    else:
+        return fny, -fnx
+
+
+def _perimeter_from_estimates(
+    estimates: dict[int, tuple],
+) -> tuple[list[tuple], tuple | None]:
+    """
+    Return perimeter wall segments and bucket position from EMA marker estimates.
+
+    estimates : marker_id → (wx, wy, fnx_w, fny_w)
+    Returns ([(x1,y1,x2,y2), ...], (bx, by)) or ([], None).
+    """
+    if not estimates:
+        return [], None
+
+    # Average plus-center
+    plus_pts = []
+    ec_vecs = []
+    for mid, (wx, wy, fnxw, fnyw) in estimates.items():
+        if mid % 2 == 1:
+            tx, ty = fnyw, -fnxw
+        else:
+            tx, ty = -fnyw, fnxw
+        plus_pts.append((wx + 0.17 * tx, wy + 0.17 * ty))
+        ec_vecs.append(_ec_from_marker_replay(mid, fnxw, fnyw))
+
+    pcx = sum(p[0] for p in plus_pts) / len(plus_pts)
+    pcy = sum(p[1] for p in plus_pts) / len(plus_pts)
+
+    sx = sum(v[0] for v in ec_vecs) / len(ec_vecs)
+    sy = sum(v[1] for v in ec_vecs) / len(ec_vecs)
+    mag = math.hypot(sx, sy)
+    if mag < 1e-3:
+        return [], None
+    ec_x, ec_y = sx / mag, sy / mag
+    ed_x, ed_y = -ec_y, ec_x   # ê_D = 90° CCW rotation of ê_C
+
+    def _to_world(lx, ly):
+        return (pcx + lx * ed_x - ly * ec_x,
+                pcy + lx * ed_y - ly * ec_y)
+
+    p1 = _to_world(*_C_WALL_P1)
+    p2 = _to_world(*_C_WALL_P2)
+    c_wall = (*p1, *p2)
+
+    p1 = _to_world(*_D_WALL_P1)
+    p2 = _to_world(*_D_WALL_P2)
+    d_wall = (*p1, *p2)
+
+    bucket_pos = _to_world(*_BUCKET_XY)
+    return [c_wall, d_wall], bucket_pos
 
 
 def _ema_aruco_up_to(
@@ -544,6 +621,27 @@ class BallMissionReplay:
                         label=lbl)
                 wall_drawn_ids.add(mid)
             all_x += [wx]; all_y += [wy]
+
+        # ── Perimeter walls + bucket ─────────────────────────────────
+        perim_segs, bucket_pos = _perimeter_from_estimates(wall_estimates)
+        for i, (x1, y1, x2, y2) in enumerate(perim_segs):
+            lbl = 'Perimeter walls' if i == 0 else None
+            ax.plot([x1, x2], [y1, y2], '-',
+                    color=C_PERIM, linewidth=2.5, zorder=3,
+                    alpha=0.80, solid_capstyle='round', label=lbl)
+            all_x += [x1, x2]; all_y += [y1, y2]
+        if bucket_pos is not None:
+            bx, by = bucket_pos
+            ax.add_patch(mpatches.Circle(
+                (bx, by), 0.10, fill=True,
+                facecolor=C_BUCKET, edgecolor='black',
+                linewidth=1.0, alpha=0.65, zorder=4,
+                label='Bucket',
+            ))
+            ax.annotate('bucket', (bx, by),
+                        xytext=(bx + 0.06, by + 0.06),
+                        fontsize=8, color=C_BUCKET, fontweight='bold')
+            all_x.append(bx); all_y.append(by)
 
         # ── ArUco marker world positions (on top of walls) ────────────
         arucos = self._arucos_up_to()

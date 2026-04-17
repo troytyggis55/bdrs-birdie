@@ -90,6 +90,26 @@ To achieve best accuracy, this mapping should be done continously with the lates
 
 **Plus-center:** The intersection of the two inner walls (center of the 60×60 arena) can be computed from any marker as `P + 0.17·t` (using the marker-appropriate t direction).  `ArenaWallModel.get_plus_center()` averages this across all qualified markers.
 
+### Outer perimiter walls and bucket mapping
+
+Approximate perimeter drawing:
+
+```
+                        |
+                \A/     |
+    /-\        B X D    |   
+    | |         /C\     |
+    \-/                 |
+                        |
+                        |
+-------------------------
+```
+
+C-Wall (bottom): Runs perpendicular to the A–C axis, at 2.55m from the plus center in the C direction (i.e. directly away from quadrant C's outer corner). The wall is 1.75m long, spanning from 0.65m to the left of the plus center (into the B/C side) to 1.10m to the right of the plus center (into the C/D side). In other words, it covers the full bottom of the arena, slightly asymmetrically centered — the plus center projects onto the wall at 0.65m from its left end.
+D-Wall (right): Runs parallel to the A–C axis, at 1.04 to the right of the plus center in the D direction (i.e. directly away from quadrant D's outer corner). It forms the right boundary of the arena. Its centered with the plus sign and is 3m long.
+Bucket: A circular obstacle positioned 1.02m to the left of the plus center (deep into the B side) and 0.64m downward (toward C). This places it roughly aligned with the left end of the C-wall and below the B/C quadrant boundary — in the open space to the lower-left of the arena square.
+
+
 ### Ball Approach Strategy
 
 Three rules that reduce pathfinding failures near walls:
