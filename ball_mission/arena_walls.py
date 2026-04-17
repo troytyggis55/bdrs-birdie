@@ -50,7 +50,7 @@ _C_WALL_P2     = ( 1.10, -1.55)   # C-wall (bottom) — right endpoint
 _D_WALL_P1     = ( 1.04, -1.50)   # D-wall (right)  — near endpoint (toward C)
 _D_WALL_P2     = ( 1.04,  1.50)   # D-wall (right)  — far endpoint  (toward A)
 _BUCKET_XY     = (-1.02, -0.64)   # bucket centre
-_BUCKET_RADIUS = 0.15              # bucket radius [m]
+_BUCKET_RADIUS = 0.2              # bucket radius [m]
 
 
 # ---------------------------------------------------------------------------

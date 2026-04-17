@@ -32,7 +32,8 @@ from pathlib import Path
 _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO))
 
-from pathfinding.pathfinding import CircleObstacle, PlannerConfig, find_safe_start
+from pathfinding.pathfinding import (CircleObstacle, WallObstacle, PlannerConfig,
+                                     find_safe_start, point_segment_distance)
 from pathfinding.realtime_pathfind import RealtimePathfinder
 
 from worldmodel.ball_world_model import BallWorldModel
@@ -53,10 +54,10 @@ from odometry.graph_nav import graph_nav
 # ---------------------------------------------------------------------------
 
 _CFG = PlannerConfig(
-    delta=0.15,
+    delta=0.05,
     goal_tolerance=0.1,
     clearance=0.00,
-    robot_radius=0.2,
+    robot_radius=0.15,
     max_steps=3000,
     smooth_path=True,
 )
@@ -91,7 +92,7 @@ _ROTATE_STEP_VEL = 1  # rotation speed during heading-align [rad/s]
 
 # Classical tracking FOV guard
 _IMG_WIDTH              = 820   # camera frame width (pixels)
-_TRACKING_FOV_X_MARGIN  = 100   # classical track invalid when ball centre is within
+_TRACKING_FOV_X_MARGIN  = 150   # classical track invalid when ball centre is within
                                 # this many pixels of the left/right edge; ball can
                                 # only re-enter classical tracking after a YOLO rescan
 
@@ -142,37 +143,45 @@ def _approach_point(ball_x: float, ball_y: float,
     return ball_x - standoff * dx / dist, ball_y - standoff * dy / dist
 
 
-def _approach_point_wall_aware(
+def _best_approach_point(
     ball_x: float, ball_y: float,
     robot_x: float, robot_y: float,
+    obstacles: list,
     standoff: float = _NAV_STANDOFF_M,
+    n_samples: int = 36,
 ) -> tuple[float, float]:
     """
-    Compute the pathfinding approach point for a ball.
+    Sample n_samples directions around the ball and return the standoff point
+    that maximises clearance from walls, other balls, and the bucket.
 
-    When wall mapping is available the approach is placed on the FAR side of
-    the ball from the plus-center, so the ball is always between the robot and
-    the arena walls.  This prevents the planner from targeting a point that is
-    squeezed between the ball and a wall.
-
-    Fallback: standard robot-relative approach when no wall data exists.
+    Falls back to the robot-relative direction when no obstacles are present.
     """
-    if _wall_model is not None:
-        plus_center = _wall_model.get_plus_center()
-        if plus_center is not None:
-            cx, cy = plus_center
-            dx = ball_x - cx
-            dy = ball_y - cy
-            dist = math.hypot(dx, dy)
-            if dist > 0.02:
-                nx, ny = dx / dist, dy / dist   # outward unit vector (away from plus)
-                ap = (ball_x + standoff * nx, ball_y + standoff * ny)
-                print(f"% FinalBallMission: wall-aware approach "
-                      f"goal=({ap[0]:.2f},{ap[1]:.2f})  "
-                      f"plus=({cx:.2f},{cy:.2f})")
-                return ap
-    # Fallback
-    return _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
+    def _clearance(px: float, py: float) -> float:
+        min_d = math.inf
+        for obs in obstacles:
+            if isinstance(obs, CircleObstacle):
+                d = math.hypot(px - obs.x, py - obs.y) - obs.r
+            else:  # WallObstacle
+                d = point_segment_distance(px, py, obs.x1, obs.y1, obs.x2, obs.y2)
+            if d < min_d:
+                min_d = d
+        return min_d if math.isfinite(min_d) else 1.0
+
+    best_score = -math.inf
+    best_pt = _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
+
+    for i in range(n_samples):
+        angle = 2 * math.pi * i / n_samples
+        px = ball_x + standoff * math.cos(angle)
+        py = ball_y + standoff * math.sin(angle)
+        score = _clearance(px, py)
+        if score > best_score:
+            best_score = score
+            best_pt = (px, py)
+
+    print(f"% FinalBallMission: best approach ({best_pt[0]:.2f},{best_pt[1]:.2f})  "
+          f"clearance={best_score:.3f} m")
+    return best_pt
 
 
 def _rotate_to_face_ball(target_color: str, world_model: BallWorldModel) -> bool:
@@ -783,30 +792,38 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
             print(f"% FinalBallMission: no estimate for {target_color}, cannot navigate")
             return False
 
-        rx, ry = _pos()
-        approach = _approach_point_wall_aware(ball.x, ball.y, rx, ry)
-        plan_bx, plan_by = ball.x, ball.y
-
-        # Build obstacle list: target ball + other ball + all known arena walls.
-        # The target ball must be an obstacle so the planner routes around it to
-        # reach the approach point (which is on the far side of the ball).
-        obstacles: list = [CircleObstacle(ball.x, ball.y, _OBS_BALL_RADIUS)]
-        if obstacle_color:
-            obs_est = world_model.get(obstacle_color)
-            if obs_est and not obs_est.collected:
-                obstacles.append(CircleObstacle(obs_est.x, obs_est.y, _OBS_BALL_RADIUS))
+        # ── Build obstacle sets ───────────────────────────────────────────
+        # wall_obs: hard constraints — never drive through these
+        wall_obs: list = []
         if _wall_model is not None:
             inner_walls = _wall_model.get_walls()
             perim_walls, bucket = _wall_model.get_perimeter_obstacles()
-            obstacles.extend(inner_walls)
-            obstacles.extend(perim_walls)
+            wall_obs.extend(inner_walls)
+            wall_obs.extend(perim_walls)
             if bucket is not None:
-                obstacles.append(bucket)
+                wall_obs.append(bucket)
             if _wall_model.marker_count() > 0:
                 print(f"% FinalBallMission: planning with "
                       f"{len(inner_walls)} inner + {len(perim_walls)} perim wall segments, "
                       f"bucket={'yes' if bucket else 'no'}, "
                       f"from {_wall_model.marker_count()} marker(s)")
+
+        # other_ball_obs: soft — used to score approach direction, but NOT added
+        # to the path planner so a tight layout never causes a planning failure
+        other_ball_obs: list = []
+        if obstacle_color:
+            obs_est = world_model.get(obstacle_color)
+            if obs_est and not obs_est.collected:
+                other_ball_obs.append(CircleObstacle(obs_est.x, obs_est.y, _OBS_BALL_RADIUS))
+
+        # Approach direction: maximise clearance from walls + other ball
+        rx, ry = _pos()
+        approach = _best_approach_point(ball.x, ball.y, rx, ry,
+                                        wall_obs + other_ball_obs)
+        plan_bx, plan_by = ball.x, ball.y
+
+        # Planning obstacles: target ball (route around it) + hard walls only
+        obstacles: list = [CircleObstacle(ball.x, ball.y, _OBS_BALL_RADIUS)] + wall_obs
 
         eff_start = find_safe_start(_pos(), approach, obstacles, _CFG)
         planner = RealtimePathfinder(goal=approach, cfg=_CFG, replan_cooldown=0.0)

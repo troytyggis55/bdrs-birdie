@@ -411,6 +411,19 @@ def astar_search(
     return [start], False
 
 
+def find_safe_goal(
+    goal: tuple[float, float],
+    start: tuple[float, float],
+    obstacles: list[Obstacle],
+    cfg: PlannerConfig,
+) -> tuple[float, float]:
+    """
+    If goal is inside one or more obstacle safety zones, project it outward to
+    the nearest free point.  Mirror of find_safe_start for the destination end.
+    """
+    return find_safe_start(goal, start, obstacles, cfg)
+
+
 def plan_path(
     start: tuple[float, float],
     goal: tuple[float, float],
@@ -420,18 +433,18 @@ def plan_path(
     """
     Compute a collision-free path from start to goal.
 
-    If start is inside an obstacle's safety zone (e.g. due to odometry drift),
-    it is automatically projected to the nearest free point before planning.
-
-    Returns (path, solved). path always contains at least [start].
-    If solved is False, the planner could not find a valid route.
+    Both start and goal are projected to the nearest free point when inside an
+    obstacle safety zone.  Returns (path, solved); path always has at least
+    [start].  solved is False only when no route exists even after projection.
     """
     if _is_point_blocked(start, obstacles, cfg):
         start = find_safe_start(start, goal, obstacles, cfg)
         if _is_point_blocked(start, obstacles, cfg):
             return [start], False
     if _is_point_blocked(goal, obstacles, cfg):
-        return [start], False
+        goal = find_safe_goal(goal, start, obstacles, cfg)
+        if _is_point_blocked(goal, obstacles, cfg):
+            return [start], False
     path, solved = astar_search(start, goal, obstacles, cfg)
     if solved and cfg.smooth_path:
         path = smooth_waypoints(path, obstacles, cfg)
