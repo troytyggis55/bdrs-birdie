@@ -1,0 +1,37 @@
+# final_ball_mission debug log
+# created 2026-04-17T17:12:44.435367
+# elapsed_s  EVENT  fields...
+#
+# BM_START        x0 y0 heading
+# BM_STATE        state_name
+# BM_POSE         x y heading
+# BM_BALL_DET     color cx cy r_px x_r y_r wx wy det_count
+# BM_ARUCO        marker_id x_r y_r fnx fny rx ry hdg
+# BM_POSE_CORRECT old_rx old_ry new_rx new_ry heading
+# BM_PATH         n x1 y1 x2 y2 ...
+# BM_REPLAN       reason eff_sx eff_sy n x1 y1 ...
+# BM_PICKUP       color elapsed_s
+# BM_DELIVER      color quadrant
+# BM_DONE         1|0 elapsed_s
+# BM_FRAME        filename label
+#
+0.0038 BM_START 0.0000 0.0000 0.0000
+0.0134 BM_STATE SCAN
+0.1304 BM_POSE 0.0000 0.0000 0.0000
+0.4549 BM_POSE -0.0000 0.0000 0.3916
+0.7616 BM_POSE -0.0000 0.0000 0.7697
+1.0742 BM_POSE -0.0010 -0.0000 1.1373
+1.3812 BM_POSE -0.0010 0.0000 1.4900
+1.6909 BM_POSE -0.0010 0.0010 1.8532
+1.9979 BM_POSE -0.0010 0.0010 2.2134
+2.3085 BM_POSE -0.0010 0.0000 2.5855
+2.6179 BM_POSE -0.0010 0.0000 2.9546
+2.9338 BM_POSE -0.0020 0.0000 -2.9849
+3.2436 BM_POSE -0.0010 0.0000 -2.6217
+3.5591 BM_POSE -0.0010 -0.0000 -2.2570
+3.8706 BM_POSE -0.0010 -0.0000 -1.8864
+4.1749 BM_POSE -0.0010 -0.0010 -1.5352
+4.4888 BM_POSE -0.0000 -0.0010 -1.1556
+4.8019 BM_POSE 0.0000 -0.0010 -0.8014
+5.1110 BM_POSE 0.0020 -0.0020 -0.4577
+5.3140 BM_DONE 0 5.3006

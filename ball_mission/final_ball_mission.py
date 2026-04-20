@@ -31,7 +31,8 @@ _REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO))
 
 from pathfinding.pathfinding import (CircleObstacle, WallObstacle, PlannerConfig,
-                                     find_safe_start, point_segment_distance)
+                                     find_safe_start, point_segment_distance,
+                                     is_step_blocked)
 from pathfinding.realtime_pathfind import RealtimePathfinder
 
 from worldmodel.ball_world_model import BallWorldModel
@@ -52,16 +53,16 @@ from odometry.graph_nav import graph_nav
 # ---------------------------------------------------------------------------
 
 _CFG = PlannerConfig(
-    delta=0.1,
+    delta=0.15,
     goal_tolerance=0.1,
     clearance=0.00,
-    robot_radius=0.16,
+    robot_radius=0.2,
     max_steps=3000,
-    clearance_weight=0.01,  # > 0 biases path away from obstacles
-    smooth_path=False,
+    clearance_weight=0.0,  # > 0 biases path away from obstacles
+    smooth_path=True,
 )
 
-_NAV_STANDOFF_M   = 0.4   # pathfinding approach point: this far behind the ball [m]
+_NAV_STANDOFF_M   = 0.3   # pathfinding approach point: this far behind the ball [m]
 _FINE_STANDOFF_M  = 0.3   # fine-approach stop distance [m]
 _OBS_BALL_RADIUS  = 0.06   # obstacle radius for other balls in pathfinder [m]
 _PICKUP_ABSENT_S  = 3.0    # ball must be absent this long to count as picked up [s]
@@ -94,9 +95,7 @@ _JUMP_THRESHOLD_M       = 1  # world-model shift that triggers YOLO sanity check
 
 # Classical tracking FOV guard
 _IMG_WIDTH              = 820   # camera frame width (pixels)
-_TRACKING_FOV_X_MARGIN  = 150   # classical track invalid when ball centre is within
-                                # this many pixels of the left/right edge; ball can
-                                # only re-enter classical tracking after a YOLO rescan
+_TRACKING_FOV_X_MARGIN  = 150   # drawn as orange lines in debug frames [px]
 
 # Debug image capture
 _IMG_LOG_EVERY_N = 2   # save an annotated frame every N classical-tracker iterations
@@ -177,20 +176,36 @@ def _best_approach_point(
                 min_d = d
         return min_d if math.isfinite(min_d) else 1.0
 
-    best_score = -math.inf
-    best_pt = _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
+    # Two-tier selection:
+    #   1. Among approach points the robot can reach without crossing an obstacle
+    #      (direct line-of-sight), pick the one with maximum clearance.
+    #   2. If every candidate is blocked, fall back to the best-clearance point
+    #      regardless of reachability (A* will still route around obstacles).
+    best_reachable_score = -math.inf
+    best_reachable_pt: tuple[float, float] | None = None
+    best_any_score = -math.inf
+    best_any_pt = _approach_point(ball_x, ball_y, robot_x, robot_y, standoff)
 
     for i in range(n_samples):
         angle = 2 * math.pi * i / n_samples
         px = ball_x + standoff * math.cos(angle)
         py = ball_y + standoff * math.sin(angle)
         score = _clearance(px, py)
-        if score > best_score:
-            best_score = score
-            best_pt = (px, py)
+        if score > best_any_score:
+            best_any_score = score
+            best_any_pt = (px, py)
+        reachable = not is_step_blocked(
+            (robot_x, robot_y), (px, py), obstacles, 0.0, _CFG.robot_radius
+        )
+        if reachable and score > best_reachable_score:
+            best_reachable_score = score
+            best_reachable_pt = (px, py)
 
+    best_pt = best_reachable_pt if best_reachable_pt is not None else best_any_pt
+    chosen_score = best_reachable_score if best_reachable_pt is not None else best_any_score
     print(f"% FinalBallMission: best approach ({best_pt[0]:.2f},{best_pt[1]:.2f})  "
-          f"clearance={best_score:.3f} m")
+          f"clearance={chosen_score:.3f} m  "
+          f"{'direct' if best_reachable_pt is not None else 'detour'}")
     return best_pt
 
 
@@ -323,14 +338,12 @@ def _annotate_frame(img, ball_data=None, aruco_list=None, label: str = ""):
 class _ClassicalTracker:
     """
     Background thread running localize_ball_lowest_contour() at ~10 Hz while
-    the robot drives. Updates the world model and the mission log continuously.
+    the robot drives. Updates the world model continuously.
 
-    FOV guard: if the ball centre pixel is within _TRACKING_FOV_X_MARGIN of the
-    left or right edge, the tracker suspends world-model updates and raises a
-    `_needs_yolo` flag.  The main loop must stop the robot, run a YOLO scan, and
-    call `revalidate()` before classical tracking resumes.  This prevents the
-    tracker from feeding pure noise into the world model when the ball is
-    partially or fully off-screen.
+    Jump guard: if a new world-frame estimate would shift the ball by more than
+    _JUMP_THRESHOLD_M from the current estimate, that measurement is discarded
+    and the tracker stops. The robot keeps navigating with the last valid world
+    model position. No YOLO recheck is triggered.
     """
     _INTERVAL_S = 0.10
 
@@ -341,16 +354,12 @@ class _ClassicalTracker:
         self._frame_label = frame_label
         self._stop_event = threading.Event()
         self._detected = threading.Event()
-        self._needs_yolo = threading.Event()   # set when ball exits FOV margin
-        self._jump_detected = threading.Event()  # set when estimate jumps > threshold
         self._frame_cnt = 0
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._stop_event.clear()
         self._detected.clear()
-        self._needs_yolo.clear()
-        self._jump_detected.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -360,46 +369,14 @@ class _ClassicalTracker:
             self._thread.join(timeout=1.0)
 
     def pop_detected(self) -> bool:
-        """Return True (and clear) if a valid in-FOV detection occurred since last call."""
+        """Return True (and clear) if a valid detection occurred since last call."""
         if self._detected.is_set():
             self._detected.clear()
             return True
         return False
 
-    def is_needs_yolo(self) -> bool:
-        """True when the ball has left the FOV margin and needs YOLO reconfirmation."""
-        return self._needs_yolo.is_set()
-
-    def revalidate(self) -> None:
-        """Call after YOLO confirms the ball position; re-enables classical tracking."""
-        self._needs_yolo.clear()
-        print(f"% FinalBallMission: Tracker [{self._color}]: revalidated by YOLO")
-
-    def is_jump_detected(self) -> bool:
-        """True when the tracker blocked an update due to a large position jump."""
-        return self._jump_detected.is_set()
-
-    def resolve_jump(self, accepted: bool) -> None:
-        """
-        Call from the main loop after a YOLO sanity check.
-        *accepted* — True if YOLO confirmed the new position (world model already
-        updated by caller); False if YOLO failed and the pre-jump estimate is kept.
-        """
-        self._jump_detected.clear()
-        verdict = "accepted" if accepted else "rejected (pre-jump estimate kept)"
-        print(f"% FinalBallMission: Tracker [{self._color}]: jump {verdict}")
-
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            # Dormant: wait for YOLO revalidation before resuming classical updates
-            if self._needs_yolo.is_set():
-                t.sleep(self._INTERVAL_S)
-                continue
-            # Dormant: wait for main loop to resolve the jump before resuming
-            if self._jump_detected.is_set():
-                t.sleep(self._INTERVAL_S)
-                continue
-
             ok, img = _grab_bgr()
             if not ok:
                 t.sleep(self._INTERVAL_S)
@@ -408,21 +385,6 @@ class _ClassicalTracker:
             found, ball_data = localize_ball_lowest_contour(img, self._color)
             if found:
                 cx, cy = ball_data['center']
-
-                # ── FOV edge guard ────────────────────────────────────────
-                if cx < _TRACKING_FOV_X_MARGIN or cx > (_IMG_WIDTH - _TRACKING_FOV_X_MARGIN):
-                    print(f"% FinalBallMission: Tracker [{self._color}]: "
-                          f"ball at FOV edge cx={cx:.0f} — suspending classical tracking")
-                    if _logger is not None:
-                        ann = _annotate_frame(
-                            img, ball_data,
-                            label=f"FOV_EDGE {self._color} cx={int(cx)}")
-                        _logger.log_frame(ann, label=f"fov_edge_{self._color}")
-                    self._needs_yolo.set()
-                    t.sleep(self._INTERVAL_S)
-                    continue
-
-                # ── Normal in-FOV update ──────────────────────────────────
                 _, _, w, h = ball_data['rect']
                 r_px = min(w, h) / 2.0
                 coords = pixels_to_robot_coords([(cx, cy, r_px)])
@@ -431,8 +393,8 @@ class _ClassicalTracker:
                     rx, ry = _pos()
                     hdg = _heading()
 
-                    # Jump guard: check how far the new world-frame estimate is
-                    # from the current one before committing the update.
+                    # Jump guard: discard measurement and stop tracking if the
+                    # new estimate is implausibly far from the current one.
                     current = self._wm.get(self._color)
                     if current is not None and not current.collected:
                         new_wx = rx + x_r * math.cos(hdg) - y_r * math.sin(hdg)
@@ -440,10 +402,8 @@ class _ClassicalTracker:
                         jump = math.hypot(new_wx - current.x, new_wy - current.y)
                         if jump > _JUMP_THRESHOLD_M:
                             print(f"% FinalBallMission: Tracker [{self._color}]: "
-                                  f"jump {jump:.2f} m detected — suspending for YOLO check")
-                            self._jump_detected.set()
-                            t.sleep(self._INTERVAL_S)
-                            continue   # skip this update entirely
+                                  f"jump {jump:.2f} m — stopping classical tracking")
+                            return  # keep last valid world-model position
 
                     self._wm.update(self._color, x_r, y_r, rx, ry, hdg)
                     est = self._wm.get(self._color)
@@ -959,7 +919,6 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                     daemon=True,
                 )
                 nav_thread.start()
-                jump_handled = False  # reset per waypoint attempt
 
                 while nav_thread.is_alive() and not service.stop:
                     nav_thread.join(timeout=_POLL_INTERVAL_S)
@@ -967,48 +926,6 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
                         break
 
                     _log_pose_maybe()
-
-                    # ── Jump sanity check ─────────────────────────────────
-                    if tracker.is_jump_detected():
-                        print(f"% FinalBallMission: {target_color} tracker jump — "
-                              f"stopping for YOLO sanity check")
-                        graph_nav._stop_nav.set()
-                        nav_thread.join()
-                        _stop()
-                        t.sleep(0.1)
-                        yolo_ok, yolo_img = _grab_bgr()
-                        if yolo_ok:
-                            _scan_aruco_passive(yolo_img)
-                            yolo_found, yolo_det = localize_ball_yolo(yolo_img, target_color)
-                            if yolo_found:
-                                ycx, ycy = yolo_det['center']
-                                _, _, yw, yh = yolo_det['rect']
-                                yr_px = min(yw, yh) / 2.0
-                                ycoords = pixels_to_robot_coords([(ycx, ycy, yr_px)])
-                                if ycoords:
-                                    yx_r, yy_r, _ = ycoords[0]
-                                    rx_now, ry_now = _pos()
-                                    hdg_now = _heading()
-                                    world_model.update(target_color, yx_r, yy_r,
-                                                       rx_now, ry_now, hdg_now)
-                                    tracker.resolve_jump(accepted=True)
-                                    tracker.revalidate()
-                                    # Only replan if YOLO confirms a significantly shifted position
-                                    ball_confirmed = world_model.get(target_color)
-                                    if (ball_confirmed is not None and
-                                            math.hypot(ball_confirmed.x - plan_bx,
-                                                       ball_confirmed.y - plan_by) > _REPLAN_DIST_M):
-                                        outcome = 'replan'
-                                        break
-                                else:
-                                    tracker.resolve_jump(accepted=False)
-                            else:
-                                tracker.resolve_jump(accepted=False)
-                        else:
-                            tracker.resolve_jump(accepted=False)
-                        # Jump resolved — resume current waypoint
-                        jump_handled = True
-                        break
 
                     # ── Replan if world model estimate has shifted ─────────
                     if tracker.pop_detected():
@@ -1025,9 +942,6 @@ def _navigate_to_ball(target_color: str, obstacle_color: str | None,
 
                 if outcome != 'done' or service.stop:
                     break
-
-                if jump_handled:
-                    continue  # retry same waypoint with fresh nav_thread
 
                 wp_idx += 1
 
@@ -1307,13 +1221,14 @@ def final_ball_mission() -> None:
                 blue_ready = blue is not None and blue.detection_count >= _SCAN_MIN_BLUE_DETECTIONS
                 scan_elapsed = t.monotonic() - scan_start
 
-                if red_ready and (blue_ready or scan_elapsed >= _SCAN_START_TIMEOUT_S):
+                if red_ready or blue_ready:
                     _stop()
                     r = world_model.get('R')
                     b = world_model.get('B')
+                    red_txt  = f"({r.x:.2f},{r.y:.2f})" if r else "unknown"
                     blue_txt = f"({b.x:.2f},{b.y:.2f})" if b else "unknown"
                     print(f"% FinalBallMission: scan ready — "
-                          f"R=({r.x:.2f},{r.y:.2f})  B={blue_txt}  "
+                          f"R={red_txt}  B={blue_txt}  "
                           f"after {scan_elapsed:.1f} s")
 
                     # Pick the closest ball first
